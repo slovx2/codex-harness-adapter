@@ -12,7 +12,7 @@
 
 ### macOS：Homebrew（后台运行）
 
-先安装并登录 Claude Code 或 Pi（至少一个），然后：
+先安装并登录 Claude Code 或 Pi（至少一个）。Claude 需要本机独立安装的 `claude` 已登录（`claude auth status` 显示已登录），然后：
 
 ```sh
 brew install slovx2/tap/codex-harness-adapter
@@ -20,7 +20,7 @@ brew services start codex-harness-adapter
 codex-harness-adapter ssh-config
 ```
 
-服务登录后自动启动、异常退出自动重启，依赖 Homebrew 的 `node@24`。日志在 `$(brew --prefix)/var/log/codex-harness-adapter.log`，停止用 `brew services stop codex-harness-adapter`。
+服务登录后自动启动、异常退出自动重启，依赖 Homebrew 的 `node@24`。日志在 `$(brew --prefix)/var/log/codex-harness-adapter.log`，停止用 `brew services stop codex-harness-adapter`。目前只提供 Apple Silicon 预编译包。
 
 ### 从源码启动
 
@@ -66,7 +66,11 @@ npm run doctor -- --harness pi
 npm run ssh-config -- --harness pi --port 7442
 ```
 
+Homebrew 安装后，上述 `npm start`、`npm run doctor`、`npm run ssh-config` 对应 `codex-harness-adapter start|doctor|ssh-config`，参数相同。
+
 自定义端口每次启动都需传入，并同步更新桌面连接。`--home <目录>` 可更改状态目录，诊断和查看配置时也需传入。
+
+适配器与引擎的环境变量（如 `CHA_CLAUDE_*`、`PI_CLI`、代理）写入 `~/.codex-harness-adapter/env`，每行 `KEY=VALUE`，前台和后台服务都会读取；修改后重启服务。
 
 - **启动失败：** 运行对应引擎的 `doctor`，按提示处理；详细日志在 `~/.codex-harness-adapter/<引擎>/`。
 - **连接失败：** 确认服务仍在运行，端口和私钥与启动输出一致。

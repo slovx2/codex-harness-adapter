@@ -4,7 +4,7 @@
 
 目前支持 Claude Code 和 Pi，通过本机 SSH 提供独立入口。引擎保留自己的原生会话、工具和配置。
 
-从[源码安装与连接说明](https://github.com/slovx2/codex-harness-adapter#从源码构建)开始。
+macOS 可用 Homebrew 安装并在后台运行，其他平台从源码启动，见[开始使用](./guide/getting-started)。
 
 - [协议能力](./reference/protocol-coverage)
 - [配置参考](./guide/configuration)

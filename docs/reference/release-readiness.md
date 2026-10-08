@@ -9,7 +9,8 @@ Claude Code 和 Pi 共用本地 SSH 启动器；独立入口只监听 `127.0.0.1
 
 | 平台 | 传输 | 终端 | 启动方式 |
 | --- | --- | --- | --- |
-| macOS / Linux | Unix socket | POSIX PTY | 前台 Go CLI |
+| macOS（Apple Silicon） | Unix socket | POSIX PTY | 前台 Go CLI，或 Homebrew `brew services` 后台服务 |
+| macOS（Intel）/ Linux | Unix socket | POSIX PTY | 前台 Go CLI |
 | Windows 原生 | 本机命名管道 | ConPTY | 前台 Go CLI `.exe` + Git Bash |
 
 Windows 的命令执行需要显式完全访问。受限命令缺少操作系统沙箱时直接报错，
@@ -28,13 +29,14 @@ Windows 的命令执行需要显式完全访问。受限命令缺少操作系统
 
 源码安装和所有依赖版本以 [README](https://github.com/slovx2/codex-harness-adapter) 为准。
 Linux 运行包由独立 `runtime-artifacts.yml` 构建并验收。
-Windows 和 macOS 当前提供源码安装，不声明已有安装器或后台服务。
+macOS 通过 `slovx2/homebrew-tap` 分发，bottle 由该 tap 的 CI 构建（目前仅 Apple Silicon），依赖 Homebrew 的 `node@24`；Windows 仍为源码安装，没有安装器或后台服务。
 
 ## 仍需真实桌面验收
 
 自动 SSH 测试不能代替 Codex 桌面界面。发布记录应明确客户端版本，以及项目选择、
 流式回复、文件修改、审批、提问、中断、历史恢复的实际结果。
-当前尚未完成这项验收，因此预览发布不声称桌面全功能已经通过。
+2026-10-08 在 macOS ChatGPT.app 上通过 Homebrew 后台服务完成了部分实测：Claude 与 Pi 均可添加 SSH 连接、选择项目目录并完成文本回合；语音聊天入口报错。
+文件修改、审批、提问、中断、历史恢复尚未在桌面端逐项验收，因此预览发布不声称桌面全功能已经通过。
 
 ## 数据和发布边界
 

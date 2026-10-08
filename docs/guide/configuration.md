@@ -1,8 +1,22 @@
 # Configuration
 
-本地入口用 `npm start` 启动，在启动终端中设置环境变量即可；无需修改登录 shell 或全局 PATH。
+本地入口用 `npm start` 或 Homebrew 的 `codex-harness-adapter start` / `brew services` 启动；无需修改登录 shell 或全局 PATH。
 默认自动检测 Claude/Pi，`--harness` 可选择单引擎，`--claude-port` / `--pi-port` 可设置两个 SSH 端口，单引擎用 `--port`。
 完整命令见[开始使用](/guide/getting-started)，桌面连接见[配置指南](/guide/gui)。
+
+## 环境文件
+
+适配器启动时读取 `~/.codex-harness-adapter/env`（`--home` 改变状态目录时为 `<home>/env`），每行 `KEY=VALUE`，空行和 `#` 开头的行忽略，允许 `export` 前缀和成对引号，值按字面使用、不做变量展开。
+后台服务不继承终端环境，下列变量及代理、`PI_CLI` 等都应写在这里；修改后重启服务（`brew services restart codex-harness-adapter`）。
+
+```sh
+# ~/.codex-harness-adapter/env
+CHA_CLAUDE_DEFAULT_MODEL=opus
+HTTPS_PROXY=http://127.0.0.1:7890
+```
+
+优先级：适配器固定变量（`CODEX_HOME`、`CHA_CLAUDE_HOME`、`CHA_PI_HOME`、`CHA_CLAUDE_IDLE_EXIT_MS`）> 启动进程已有的同名变量 > 环境文件。
+文件里写入密钥时用 `chmod 600` 限制权限，不要提交到任何仓库。
 
 下列高级环境变量主要控制 Claude 适配器（`CHA_CLAUDE_*`）。Pi 使用原生 `PI_CODING_AGENT_DIR` 和 `PI_CLI`。
 
@@ -18,7 +32,7 @@ export CHA_CLAUDE_RUNTIME_TYPE="agent-sdk-sidecar"
 #   mock       - local protocol testing
 ```
 
-See [Backends](/guide/backends) for what each route supports.
+See [Backends](/guide/backends) for what each route supports. 本地入口在环境文件中设置 `CHA_CLAUDE_RUNTIME_TYPE` 后重启生效（`codex` 直通依赖 shim，除外）；`codex-harness-adapter-mode` 只用于远程 shim 部署。
 
 ## Provider and agent-loop selection
 
@@ -93,7 +107,9 @@ export CHA_CLAUDE_WORKTREE_ROOT="$HOME/.codex-harness-adapter/worktrees"
 
 When enabled, each new Codex thread runs in a dedicated `git worktree`.
 
-## Daemon
+## Daemon（仅远程 shim 部署）
+
+以下变量只对[远程主机 shim 部署](/guide/deployment)生效；本地 SSH 入口固定不空闲退出，并通过 `--node` 选择 Node。
 
 ```bash
 # Idle shutdown grace period in ms (default 15000; 0 = never exit).
@@ -107,11 +123,11 @@ export CHA_CLAUDE_NODE="/absolute/path/to/node"
 
 | Setting | Purpose |
 | --- | --- |
-| `CHA_CLAUDE_ADAPTER` | Path to `packages/claude/dist/claude/src/adapter.mjs` (used by the shim). |
-| `CHA_CLAUDE_NODE` | Node binary the shim launches. |
+| `CHA_CLAUDE_ADAPTER` | 仅 shim：`packages/claude/dist/claude/src/adapter.mjs` 路径。 |
+| `CHA_CLAUDE_NODE` | 仅 shim：shim 启动的 Node。本地入口用 `--node`。 |
 | `CHA_CLAUDE_COMPAT_VERSION` | Codex app-server version advertised (default `0.157.1`); separate from minimum CLI versions. |
 | `CHA_CLAUDE_VERSION_SUFFIX` | Tag after the version to distinguish the adapter from real codex (default `codex-harness-adapter`; set `""` to behave exactly like upstream codex). |
-| `CODEX_REAL` | Real Codex CLI for non-app-server commands / `codex` passthrough. |
+| `CODEX_REAL` | 仅 shim：处理非 app-server 命令和 `codex` 直通的真实 Codex CLI。 |
 | `CHA_CLAUDE_CLI` | 宿主 Claude Code 可执行文件，默认从 PATH 查找 claude。运行时诊断接受 CLI >= 2.1.282 的稳定版，配置仍由原生 CLAUDE_CONFIG_DIR 提供。 |
 | `CHA_CLAUDE_RUNTIME_TYPE` | Active backend route. |
 | `CHA_CLAUDE_PROVIDER` | Provider descriptor id (`claude-code` or `codex`) mapped only to existing runtime behavior. |
@@ -126,6 +142,6 @@ export CHA_CLAUDE_NODE="/absolute/path/to/node"
 | `CHA_CLAUDE_ADD_DIRS` | Extra directories exposed to Claude. |
 | `CHA_CLAUDE_ENABLE_FILE_CHECKPOINTING` | Enable SDK file checkpointing. |
 | `CHA_CLAUDE_AUTO_WORKTREE` / `_WORKTREE_ROOT` | Per-thread worktree isolation. |
-| `CHA_CLAUDE_IDLE_EXIT_MS` | Daemon idle shutdown. |
+| `CHA_CLAUDE_IDLE_EXIT_MS` | 仅 shim：守护进程空闲退出；本地入口固定为 `0`。 |
 | `CHA_CLAUDE_MOCK` | Run the protocol without Claude credentials. |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` | Claude auth / custom endpoint configuration. Keep real values out of git. |

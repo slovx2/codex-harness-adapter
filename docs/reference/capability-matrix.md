@@ -69,7 +69,7 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Realtime audio | Unsupported | No Claude audio channel; methods ack so capability probe doesn't error; listVoices returns empty. |
+| Realtime audio | Unsupported | No Claude audio channel; methods ack so capability probe doesn't error; listVoices returns empty. 2026-10-08 实测 ChatGPT.app 点击语音聊天会报 `itemsBackwardsCursor` / `turnsBackwardsCursor` 缺失，尚未修复。 |
 | Plugins/marketplace/apps | N/A | No Codex plugin marketplace; methods return empty schema-shaped responses. (Claude skills/hooks are surfaced — see Utilities.) |
 | Account/rate limits/auth | N/A | Claude manages its own auth; account/OpenAI-auth panels report null/empty. |
 | External agent import | Stub | `externalAgentConfig/detect` and import return empty. |

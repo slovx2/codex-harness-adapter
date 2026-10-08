@@ -2,6 +2,7 @@
 
 ```bash
 npm test                              # build + unit tests (node --test)
+npm run test:local-ssh                # 本地 SSH 入口 + 真实 SDK + 回环 mock provider
 npm run doctor                        # environment checks
 npm run smoke:real                    # real Claude turn (needs Anthropic/Bedrock/Vertex auth)
 npm run acceptance:local-remote       # local shim/daemon/proxy + real Claude file edit
@@ -10,6 +11,12 @@ npm run probe:codex-cli-remote        # probes the local codex --remote CLI beha
 ```
 
 ## What each check does
+
+- **`test:local-ssh`** 是当前默认入口（`npm start` / Homebrew 后台服务）的主要自动验收：真实 SSH、真实 SDK 与本地 mock provider，
+  不使用个人模型凭据；不代表桌面界面已验收。
+
+下面的 `acceptance:local-remote`、`acceptance:gui-ssh-localhost` 与 `probe:codex-cli-remote` 验证的是
+[远程主机 shim 部署](/guide/deployment)。
 
 - **`acceptance:local-remote`** creates an ignored
   `.codex-harness-adapter/local-remote-acceptance-*` directory, installs the shim into a

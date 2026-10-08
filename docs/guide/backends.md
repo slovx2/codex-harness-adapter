@@ -14,6 +14,11 @@ default Agent SDK route.
 
 ## Switching routes
 
+::: tip 本地 SSH 入口
+`npm start` 或 Homebrew 后台服务不读取 `runtime.env`，也不经过 shim：在[环境文件](/guide/configuration#环境文件)中设置
+`CHA_CLAUDE_RUNTIME_TYPE` 并重启即可切换（`codex` 直通除外）。下面的 `codex-harness-adapter-mode` 只用于[远程主机 shim 部署](/guide/deployment)。
+:::
+
 Install the host helper next to the shim:
 
 ```bash

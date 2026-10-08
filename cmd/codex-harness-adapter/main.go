@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 )
 
@@ -18,6 +19,7 @@ type configuration struct {
 	harness, home, root, node string
 	port                      int
 	claudePort, piPort        int
+	userEnv                   map[string]string
 }
 
 func main() {
@@ -34,7 +36,7 @@ func main() {
 
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
-		fmt.Println("用法: codex-harness-adapter start|init|serve|ssh-config|doctor [选项]\nstart: 自动初始化并启动可用的 Claude Code 和 Pi；可用 --harness claude-code|pi 仅启动一个\n全部启动端口: --claude-port 7331 --pi-port 7332\n单入口端口: --harness claude-code|pi --port PORT\n公共选项: --home DIR --node PATH --root DIR\n首次连接: Codex 设置 → 连接 → SSH → 添加；可选将输出的配置加入 ~/.ssh/config；Ctrl-C 停止全部入口")
+		fmt.Println("用法: codex-harness-adapter start|init|serve|ssh-config|doctor [选项]\nstart: 自动初始化并启动可用的 Claude Code 和 Pi；可用 --harness claude-code|pi 仅启动一个\n全部启动端口: --claude-port 7331 --pi-port 7332\n单入口端口: --harness claude-code|pi --port PORT\n公共选项: --home DIR --node PATH --root DIR\n环境文件: <home>/env，每行 KEY=VALUE，前台和后台服务启动都会读取\n首次连接: Codex 设置 → 连接 → SSH → 添加；可选将输出的配置加入 ~/.ssh/config；Ctrl-C 停止全部入口")
 		return nil
 	}
 	if args[0] == "entry" {
@@ -142,7 +144,10 @@ func parseConfiguration(args []string) (configuration, error) {
 	if err != nil {
 		return cfg, err
 	}
-	cfg.root, err = filepath.Abs(cfg.root)
+	if cfg.root, err = filepath.Abs(cfg.root); err != nil {
+		return cfg, err
+	}
+	cfg.userEnv, err = loadUserEnvironment(cfg.home)
 	return cfg, err
 }
 
@@ -173,15 +178,18 @@ func (c configuration) environment() []string {
 		"CHA_CLAUDE_IDLE_EXIT_MS": "0",
 	}
 	result := []string{}
+	present := map[string]bool{}
 	for _, entry := range os.Environ() {
-		keep := true
-		for name := range values {
-			if len(entry) > len(name) && entry[:len(name)+1] == name+"=" {
-				keep = false
-			}
+		name, _, _ := strings.Cut(entry, "=")
+		if _, fixed := values[name]; fixed {
+			continue
 		}
-		if keep {
-			result = append(result, entry)
+		present[name] = true
+		result = append(result, entry)
+	}
+	for name, value := range c.userEnv {
+		if _, fixed := values[name]; !fixed && !present[name] {
+			result = append(result, name+"="+value)
 		}
 	}
 	for name, value := range values {

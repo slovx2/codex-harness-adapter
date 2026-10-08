@@ -1,4 +1,9 @@
-# Deployment
+# Deployment（远程主机 shim，高级）
+
+::: tip 大多数场景不需要本页
+本机使用请按[开始使用](/guide/getting-started)运行 `npm start` 或 Homebrew 后台服务，自带仅监听本机的 SSH 入口，
+不需要系统 sshd、`codex` shim 或修改 `~/.zshenv`。本页只适用于让 Codex App 通过系统 SSH 连接远程主机、并由 shim 接管 `codex` 的旧部署方式，目前仅支持 Claude。
+:::
 
 The deployment target is a remote SSH host with a `codex` shim earlier in the
 login-shell `PATH`.
@@ -42,7 +47,7 @@ deployment configuration and avoid committing private URLs.
 A clean machine usually needs only four user-space tools:
 
 ```bash
-# 1. Node 24 (stable node:sqlite) — pick your platform tarball from nodejs.org/dist.
+# 1. Node 24 — pick your platform tarball from nodejs.org/dist/latest-v24.x.
 curl -fsSL https://nodejs.org/dist/latest-v24.x/node-<version>-darwin-arm64.tar.xz | tar -xJ -C ~/.local
 
 # 2. Claude Code CLI under a user prefix.

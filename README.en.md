@@ -12,7 +12,7 @@ Currently supports Claude Code and Pi on macOS, Linux, and Windows.
 
 ### macOS: Homebrew (background service)
 
-Install and sign in to Claude Code or Pi (at least one), then:
+Install and sign in to Claude Code or Pi (at least one). Claude needs the standalone `claude` CLI signed in (`claude auth status` reports logged in). Then:
 
 ```sh
 brew install slovx2/tap/codex-harness-adapter
@@ -20,7 +20,7 @@ brew services start codex-harness-adapter
 codex-harness-adapter ssh-config
 ```
 
-The service starts at login and restarts if it exits unexpectedly. It uses Homebrew's `node@24`. Logs go to `$(brew --prefix)/var/log/codex-harness-adapter.log`; stop it with `brew services stop codex-harness-adapter`.
+The service starts at login and restarts if it exits unexpectedly. It uses Homebrew's `node@24`. Logs go to `$(brew --prefix)/var/log/codex-harness-adapter.log`; stop it with `brew services stop codex-harness-adapter`. Prebuilt packages are currently Apple Silicon only.
 
 ### Run from source
 
@@ -66,7 +66,11 @@ npm run doctor -- --harness pi
 npm run ssh-config -- --harness pi --port 7442
 ```
 
+With Homebrew, use `codex-harness-adapter start|doctor|ssh-config` instead of `npm start`, `npm run doctor`, and `npm run ssh-config`; the options are the same.
+
 Pass custom ports on every launch and update the desktop connection accordingly. Use `--home <directory>` to change the state directory; pass it to diagnostics and configuration commands too.
+
+Put adapter and harness environment variables (such as `CHA_CLAUDE_*`, `PI_CLI`, or proxies) in `~/.codex-harness-adapter/env`, one `KEY=VALUE` per line. Both foreground runs and the background service read it; restart the service after changes.
 
 - **Startup fails:** Run `doctor` for that harness and follow its guidance. Detailed logs are in `~/.codex-harness-adapter/<harness>/`.
 - **Connection fails:** Check that the service is running and the port and private key match its output.

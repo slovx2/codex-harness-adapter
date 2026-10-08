@@ -5,6 +5,12 @@ The project is still private in `package.json`; this file tracks release notes
 for maintainers preparing the next public release and does not change package
 versioning or publishing metadata.
 
+## 0.4.1
+
+- CLI 启动时读取 `~/.codex-harness-adapter/env`（每行 `KEY=VALUE`），后台服务也可配置
+  `CHA_CLAUDE_*`、`PI_CLI`、代理等；启动进程已有的同名变量优先。
+- 文档补充 Homebrew 用法、环境文件与 Claude 登录前提，标注仅适用于远程 shim 部署的内容，删除过时的 `TYRS_HAND.md`。
+
 ## 0.4.0
 
 - macOS 可通过 `brew install slovx2/tap/codex-harness-adapter` 安装，并用

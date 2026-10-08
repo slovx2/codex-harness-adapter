@@ -3,6 +3,10 @@
 These examples show safe local setup patterns. They intentionally use
 placeholders and do not include real credentials.
 
+本机的 `npm start` 或 Homebrew 后台服务不需要下面的 shim 与 shell 导出：变量写入
+`~/.codex-harness-adapter/env`（见 [Configuration](../docs/guide/configuration.md#环境文件)）。
+以下示例只适用于[远程主机 shim 部署](../docs/guide/deployment.md)。
+
 ## Local shell exports
 
 Use your shell, a local secret manager, or your deployment system to inject

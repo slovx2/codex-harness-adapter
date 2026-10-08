@@ -6,7 +6,7 @@ import { CODEX_PROTOCOL_VERSION } from '../../shared/src/runtime-version.mjs'
 
 export const versions = {
   protocol: CODEX_PROTOCOL_VERSION,
-  node: '24.14.0',
+  node: '24.0.0',
   sdk: '0.99.1',
   cli: '0.99.1',
   plan: '0.58.3',

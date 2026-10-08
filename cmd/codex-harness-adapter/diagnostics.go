@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,7 +20,11 @@ import (
 type runtimeDetails struct {
 	Engine          string `json:"engine"`
 	ProtocolVersion string `json:"protocolVersion"`
+	NodeVersion     string `json:"nodeVersion"`
 }
+
+// 用户环境只要求 Node 24 及以上稳定版。
+const minimumNodeMajor = 24
 
 // 原始诊断只保存在本入口的私有日志中，不把 JSON、警告和堆栈混入用户输出。
 func openLocalLog(c configuration, name string) (*os.File, error) {
@@ -97,6 +102,9 @@ func inspectRuntime(ctx context.Context, c configuration) (runtimeDetails, error
 	}
 	if err := json.Unmarshal(output, &info); err != nil || info.Engine != c.harness || info.ProtocolVersion == "" {
 		return info, diagnosticError(c, "环境检查结果无效，请运行 npm run setup 重新构建")
+	}
+	if major, err := strconv.Atoi(strings.SplitN(info.NodeVersion, ".", 2)[0]); err != nil || major < minimumNodeMajor {
+		return info, diagnosticError(c, fmt.Sprintf("Node.js 版本过低，需要 Node %d 或更高版本，可用 --node 指定路径", minimumNodeMajor))
 	}
 	return info, nil
 }

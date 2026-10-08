@@ -16,7 +16,9 @@ case "${3:-}" in
     ;;
   *) echo '未知构建选项' >&2; exit 1 ;;
 esac
-test "$(node --version)" = 'v24.14.0'
+# 制品不再附带 Node：运行时使用宿主 PATH 中的 Node 24。
+test "$(node -p 'process.versions.node.split(".")[0]')" = 24 || { echo '必须使用 Node 24' >&2; exit 1; }
+node_dir=$(dirname "$(command -v node)")
 test "$(uname -s)-$(uname -m)" = 'Linux-x86_64'
 npm ci --prefix "$adapter_source" --no-audit --no-fund
 npm ci --prefix "$adapter_source/packages/pi" --no-audit --no-fund
@@ -25,8 +27,6 @@ stage=$(mktemp -d)
 trap 'rm -r -- "$stage"' EXIT HUP INT TERM
 runtime="$stage/pi-runtime"
 mkdir -p "$runtime/bin" "$runtime/lib/scripts" "$stage/home"
-cp "$(command -v node)" "$runtime/bin/node"
-cp "$(dirname "$(command -v node)")/../LICENSE" "$runtime/LICENSE.node"
 cp "$adapter_source/THIRD_PARTY_NOTICES.md" "$runtime/THIRD_PARTY_NOTICES.md"
 cp -R "$adapter_source/packages/pi/dist" "$adapter_source/packages/pi/node_modules" "$runtime/lib/"
 node "$project_root/scripts/pi-runtime-platforms.mjs" prune "$runtime/lib/node_modules"
@@ -40,18 +40,18 @@ cat > "$runtime/bin/codex-harness-adapter-pi" <<'WRAPPER'
 #!/bin/sh
 set -eu
 runtime_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-exec "$runtime_root/bin/node" "$runtime_root/lib/dist/pi/src/adapter.mjs" "$@"
+exec node "$runtime_root/lib/dist/pi/src/adapter.mjs" "$@"
 WRAPPER
-chmod 0755 "$runtime/bin/codex-harness-adapter-pi" "$runtime/bin/node"
+chmod 0755 "$runtime/bin/codex-harness-adapter-pi"
 # 仅用构建依赖中的真实官方 CLI 检查版本；不安装、复制用户全局 CLI。
 cat > "$stage/pi-test-cli" <<'WRAPPER'
 #!/bin/sh
-exec "$PI_TEST_RUNTIME/bin/node" "$PI_TEST_RUNTIME/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js" "$@"
+exec node "$PI_TEST_RUNTIME/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js" "$@"
 WRAPPER
 chmod 0755 "$stage/pi-test-cli"
-env -i PATH=/usr/bin:/bin HOME="$stage/home" PI_CLI="$stage/pi-test-cli" PI_TEST_RUNTIME="$runtime" \
+env -i PATH="$node_dir:/usr/bin:/bin" HOME="$stage/home" PI_CLI="$stage/pi-test-cli" PI_TEST_RUNTIME="$runtime" \
   "$runtime/bin/codex-harness-adapter-pi" --runtime-info > "$runtime/build.json"
-env -i PATH=/usr/bin:/bin HOME="$stage/home" "$runtime/bin/codex-harness-adapter-pi" --pty-self-check
+env -i PATH="$node_dir:/usr/bin:/bin" HOME="$stage/home" "$runtime/bin/codex-harness-adapter-pi" --pty-self-check
 test ! -d "$runtime/lib/node_modules/@anthropic-ai/claude-agent-sdk"
 node --input-type=module - "$runtime" "$adapter_source" "$build_kind" "$actual_commit" <<'JS'
 import {readFileSync,writeFileSync,readdirSync} from 'node:fs'
@@ -60,7 +60,7 @@ const root=process.argv[2]
 const source=process.argv[3]
 const info=JSON.parse(readFileSync(`${root}/build.json`))
 const pin=JSON.parse(readFileSync(`${root}/versions.json`))
-if(info.engine!=='pi' || info.nodeVersion!==pin.node || info.protocolVersion!==pin.codexProtocol ||
+if(info.engine!=='pi' || info.nodeVersion.split('.')[0]!==pin.node || info.protocolVersion!==pin.codexProtocol ||
    info.sdkVersion!==pin.piCodingAgent || info.cliBuild!==pin.piCli ||
    info.pluginVersions['@narumitw/pi-plan-mode']!==pin.piPlanMode ||
    info.pluginVersions['@narumitw/pi-tui-kit']!==pin.piTuiKit ||
@@ -85,9 +85,9 @@ tar -C "$stage" -czf "$artifact_dir/$asset" pi-runtime
 (cd "$artifact_dir" && sha256sum "$asset" > "$asset.sha256")
 mkdir "$stage/unpacked"
 tar -C "$stage/unpacked" -xzf "$artifact_dir/$asset"
-"$stage/unpacked/pi-runtime/bin/node" "$project_root/scripts/pi-runtime-platforms.mjs" check "$stage/unpacked/pi-runtime/lib/node_modules"
-env -i PATH=/usr/bin:/bin HOME="$stage/home" PI_CLI="$stage/pi-test-cli" PI_TEST_RUNTIME="$stage/unpacked/pi-runtime" \
+node "$project_root/scripts/pi-runtime-platforms.mjs" check "$stage/unpacked/pi-runtime/lib/node_modules"
+env -i PATH="$node_dir:/usr/bin:/bin" HOME="$stage/home" PI_CLI="$stage/pi-test-cli" PI_TEST_RUNTIME="$stage/unpacked/pi-runtime" \
   "$stage/unpacked/pi-runtime/bin/codex-harness-adapter-pi" --runtime-info
-env -i PATH=/usr/bin:/bin HOME="$stage/home" "$stage/unpacked/pi-runtime/bin/codex-harness-adapter-pi" --pty-self-check
+env -i PATH="$node_dir:/usr/bin:/bin" HOME="$stage/home" "$stage/unpacked/pi-runtime/bin/codex-harness-adapter-pi" --pty-self-check
 node "$adapter_source/packages/pi/test/artifact-smoke.mjs" "$stage/unpacked/pi-runtime"
 echo "$artifact_dir/$asset"

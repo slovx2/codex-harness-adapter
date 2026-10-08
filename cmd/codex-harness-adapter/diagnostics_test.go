@@ -44,7 +44,7 @@ func TestDoctorShowsResultAndKeepsDetailsInLog(t *testing.T) {
 	cfg := testConfiguration(t)
 	writeStartFixture(t, cfg)
 	fixture := `console.error('ExperimentalWarning: SQLite INTERNAL_DETAIL');
-if (process.argv.includes('--runtime-info')) console.log(JSON.stringify({engine:'pi',protocolVersion:'0.157.1',releaseReady:false,cliSha256:'INTERNAL_DETAIL'}));
+if (process.argv.includes('--runtime-info')) console.log(JSON.stringify({engine:'pi',protocolVersion:'0.157.1',nodeVersion:process.versions.node,releaseReady:false,cliSha256:'INTERNAL_DETAIL'}));
 else console.log('pty-self-check ok');`
 	if err := os.WriteFile(cfg.adapter(), []byte(fixture), 0o600); err != nil {
 		t.Fatal(err)
@@ -66,6 +66,7 @@ func TestDiagnosticFailuresRemainActionable(t *testing.T) {
 		{"invalid-response", `console.log('INTERNAL_DETAIL invalid JSON');`, "检查结果无效"},
 		{"unexpected-error", `console.error('Error: INTERNAL_DETAIL\n    at internal'); process.exit(1);`, "重新安装和构建"},
 		{"old-cli", `console.error('需要用户安装的 Pi CLI >= 0.99.1 INTERNAL_DETAIL'); process.exit(1);`, "最低稳定版本"},
+		{"old-node", `console.error('INTERNAL_DETAIL'); console.log(JSON.stringify({engine:'pi',protocolVersion:'0.157.1',nodeVersion:'22.23.1'}));`, "Node.js 版本过低"},
 		{"sandbox", `console.error('Claude 沙箱依赖不可用: bwrap INTERNAL_DETAIL'); process.exit(1);`, "沙箱依赖不可用"},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {

@@ -87,7 +87,7 @@ func TestForegroundSSHAndCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	fixture := `import net from 'node:net';
-if (process.argv.includes('--runtime-info')) console.log(JSON.stringify({engine:'pi',protocolVersion:'0.157.1'}));
+if (process.argv.includes('--runtime-info')) console.log(JSON.stringify({engine:'pi',protocolVersion:'0.157.1',nodeVersion:process.versions.node}));
 else { const socket=process.argv.at(-1).slice(7); net.createServer(c=>{c.on('error',()=>{});c.end('runtime-proxy')}).listen(socket); }
 `
 	if err := os.WriteFile(cfg.adapter(), []byte(fixture), 0o600); err != nil {

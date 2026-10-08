@@ -8,9 +8,23 @@
 
 目前支持 Claude Code、Pi，适用于 macOS、Linux、Windows。
 
-## 从源码启动
+## 安装与启动
 
-准备 Node.js **≥ 24.14.0**、Go **≥ 1.26.6**，以及至少一个已配置登录的引擎：[Claude Code **≥ 2.1.282**](https://code.claude.com/docs/en/setup) 或 [Pi **≥ 0.99.1**](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/README.md#getting-started)。接受更高稳定版本，无需安装精确版本。[各系统依赖](docs/guide/getting-started.md#系统依赖)
+### macOS：Homebrew（后台运行）
+
+先安装并登录 Claude Code 或 Pi（至少一个），然后：
+
+```sh
+brew install slovx2/tap/codex-harness-adapter
+brew services start codex-harness-adapter
+codex-harness-adapter ssh-config
+```
+
+服务登录后自动启动、异常退出自动重启，依赖 Homebrew 的 `node@24`。日志在 `$(brew --prefix)/var/log/codex-harness-adapter.log`，停止用 `brew services stop codex-harness-adapter`。
+
+### 从源码启动
+
+准备 Node.js **24**、Go **≥ 1.26.6**，以及至少一个已配置登录的引擎：[Claude Code **≥ 2.1.282**](https://code.claude.com/docs/en/setup) 或 [Pi **≥ 0.99.1**](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/README.md#getting-started)。接受更高稳定版本，无需安装精确版本。[各系统依赖](docs/guide/getting-started.md#系统依赖)
 
 ```sh
 git clone https://github.com/slovx2/codex-harness-adapter.git

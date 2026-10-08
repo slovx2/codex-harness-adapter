@@ -24,14 +24,19 @@ function packageDirectories(root) {
   return paths
 }
 
-export function platformPackages(root, { prune = false, smoke = false } = {}) {
+// 默认目标为 Linux amd64 运行包；Homebrew 安装按本机 os/cpu 裁剪，libc 仅对 Linux 有意义。
+export function platformPackages(
+  root,
+  { prune = false, smoke = false, os = 'linux', cpu = 'x64' } = {},
+) {
   const removed = []
   let esbuildCount = 0
   function walk(modules) {
     for (const path of packageDirectories(modules)) {
       const pkg = JSON.parse(readFileSync(join(path, 'package.json'), 'utf8'))
-      if (!matches(pkg.os, 'linux') || !matches(pkg.cpu, 'x64') || !matches(pkg.libc, 'glibc')) {
-        if (!prune) throw new Error(`Pi Linux amd64 制品含其他平台包: ${path}`)
+      const libc = os !== 'linux' || matches(pkg.libc, 'glibc')
+      if (!matches(pkg.os, os) || !matches(pkg.cpu, cpu) || !libc) {
+        if (!prune) throw new Error(`Pi ${os}-${cpu} 制品含其他平台包: ${path}`)
         removed.push({ name: pkg.name, version: pkg.version })
         rmSync(path, { recursive: true })
         continue
@@ -54,12 +59,15 @@ export function platformPackages(root, { prune = false, smoke = false } = {}) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const mode = process.argv[2]
-  if (!['prune', 'check'].includes(mode)) throw new Error('需要 prune 或 check')
+  if (!['prune', 'check'].includes(mode))
+    throw new Error('需要 prune 或 check；可选参数：目录 os cpu')
   console.log(
     JSON.stringify(
       platformPackages(resolve(process.argv[3]), {
         prune: mode === 'prune',
         smoke: mode === 'check',
+        ...(process.argv[4] ? { os: process.argv[4] } : {}),
+        ...(process.argv[5] ? { cpu: process.argv[5] } : {}),
       }),
     ),
   )

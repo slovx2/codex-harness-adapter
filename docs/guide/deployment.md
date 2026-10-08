@@ -43,11 +43,11 @@ A clean machine usually needs only four user-space tools:
 
 ```bash
 # 1. Node 24 (stable node:sqlite) — pick your platform tarball from nodejs.org/dist.
-curl -fsSL https://nodejs.org/dist/v24.11.0/node-v24.11.0-darwin-arm64.tar.xz | tar -xJ -C ~/.local
+curl -fsSL https://nodejs.org/dist/latest-v24.x/node-<version>-darwin-arm64.tar.xz | tar -xJ -C ~/.local
 
 # 2. Claude Code CLI under a user prefix.
 mkdir -p ~/.local/npm-global
-~/.local/node-v24.11.0-darwin-arm64/bin/npm config set prefix ~/.local/npm-global
+~/.local/node-<version>-darwin-arm64/bin/npm config set prefix ~/.local/npm-global
 ~/.local/npm-global/bin/npm install -g @anthropic-ai/claude-code
 ~/.local/npm-global/bin/claude /login        # interactive: claude.ai OAuth
 
@@ -57,9 +57,9 @@ npm install && npm run build
 
 # 4. Persist PATH + adapter pointers for non-interactive SSH.
 cat >>~/.zshenv <<'EOF'
-export PATH="$HOME/.local/npm-global/bin:$HOME/.local/node-v24.11.0-darwin-arm64/bin:$HOME/.local/bin:$PATH"
+export PATH="$HOME/.local/npm-global/bin:$HOME/.local/node-<version>-darwin-arm64/bin:$HOME/.local/bin:$PATH"
 export CHA_CLAUDE_ADAPTER="$HOME/codex-harness-adapter/packages/claude/dist/claude/src/adapter.mjs"
-export CHA_CLAUDE_NODE="$HOME/.local/node-v24.11.0-darwin-arm64/bin/node"
+export CHA_CLAUDE_NODE="$HOME/.local/node-<version>-darwin-arm64/bin/node"
 EOF
 cp scripts/codex-shim ~/.local/bin/codex && chmod +x ~/.local/bin/codex
 

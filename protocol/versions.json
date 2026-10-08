@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/slovx2/codex-harness-adapter",
-  "node": "24.14.0",
+  "node": "24",
   "claudeAgentSdk": "0.3.282",
   "codexProtocol": "0.157.1",
   "claudeCli": "2.1.282",

@@ -8,9 +8,23 @@
 
 Currently supports Claude Code and Pi on macOS, Linux, and Windows.
 
-## Run from source
+## Install and run
 
-Install Node.js **≥ 24.14.0**, Go **≥ 1.26.6**, and at least one configured harness: [Claude Code **≥ 2.1.282**](https://code.claude.com/docs/en/setup) or [Pi **≥ 0.99.1**](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/README.md#getting-started). Newer stable versions are accepted; exact versions are not required. [Platform dependencies](docs/guide/getting-started.md#系统依赖)
+### macOS: Homebrew (background service)
+
+Install and sign in to Claude Code or Pi (at least one), then:
+
+```sh
+brew install slovx2/tap/codex-harness-adapter
+brew services start codex-harness-adapter
+codex-harness-adapter ssh-config
+```
+
+The service starts at login and restarts if it exits unexpectedly. It uses Homebrew's `node@24`. Logs go to `$(brew --prefix)/var/log/codex-harness-adapter.log`; stop it with `brew services stop codex-harness-adapter`.
+
+### Run from source
+
+Install Node.js **24**, Go **≥ 1.26.6**, and at least one configured harness: [Claude Code **≥ 2.1.282**](https://code.claude.com/docs/en/setup) or [Pi **≥ 0.99.1**](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/README.md#getting-started). Newer stable versions are accepted; exact versions are not required. [Platform dependencies](docs/guide/getting-started.md#系统依赖)
 
 ```sh
 git clone https://github.com/slovx2/codex-harness-adapter.git

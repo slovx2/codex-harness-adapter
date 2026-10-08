@@ -5,6 +5,14 @@ The project is still private in `package.json`; this file tracks release notes
 for maintainers preparing the next public release and does not change package
 versioning or publishing metadata.
 
+## 0.4.0
+
+- macOS 可通过 `brew install slovx2/tap/codex-harness-adapter` 安装，并用
+  `brew services` 在后台常驻；依赖 Homebrew 的 `node@24`。
+- Node 要求放宽为 24（>= 24.0.0）；CLI 检查不满足时直接报错。
+- Linux 运行包不再附带 Node，改用宿主 PATH 中的 Node 24。
+- CLI 通过符号链接启动时按真实安装位置推导根目录。
+
 ## Unreleased
 
 ### App-server and protocol compatibility

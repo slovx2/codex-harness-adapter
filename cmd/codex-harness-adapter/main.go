@@ -101,6 +101,10 @@ func parseConfiguration(args []string) (configuration, error) {
 	if err != nil {
 		return configuration{}, err
 	}
+	// Homebrew 等通过符号链接暴露命令，默认根目录需按真实安装位置推导。
+	if executable, err = filepath.EvalSymlinks(executable); err != nil {
+		return configuration{}, err
+	}
 	flags := flag.NewFlagSet("codex-harness-adapter", flag.ContinueOnError)
 	cfg := configuration{}
 	flags.StringVar(&cfg.harness, "harness", "", "claude-code 或 pi")

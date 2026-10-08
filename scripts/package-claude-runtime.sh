@@ -1,5 +1,5 @@
 #!/bin/sh
-# 保留固定 Node 和 SDK；Claude CLI 来自宿主独立安装，版本由 versions 校验。
+# 保留固定 SDK；Node 24 与 Claude CLI 均来自宿主独立安装，版本由 versions 校验。
 set -eu
 adapter_source=${1:?需要适配器仓库目录}
 artifact_dir=${2:?需要制品输出目录}
@@ -16,7 +16,8 @@ case "${3:-}" in
     ;;
   *) echo '未知构建选项' >&2; exit 1 ;;
 esac
-test "$(node --version)" = 'v24.14.0' || { echo '必须使用 Node 24.14.0' >&2; exit 1; }
+test "$(node -p 'process.versions.node.split(".")[0]')" = 24 || { echo '必须使用 Node 24' >&2; exit 1; }
+node_dir=$(dirname "$(command -v node)")
 test "$(uname -s)" = 'Linux' || { echo '本制品必须在 Linux 构建' >&2; exit 1; }
 test "$(uname -m)" = 'x86_64' || { echo '本制品必须在 amd64 构建' >&2; exit 1; }
 npm ci --prefix "$adapter_source"
@@ -26,8 +27,6 @@ npm prune --omit=dev --omit=optional --prefix "$adapter_source/packages/claude"
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT HUP INT TERM
 mkdir -p "$stage/claude-runtime/bin" "$stage/claude-runtime/lib/scripts" "$stage/home"
-cp "$(command -v node)" "$stage/claude-runtime/bin/node"
-cp "$(dirname "$(command -v node)")/../LICENSE" "$stage/claude-runtime/LICENSE.node"
 cp "$adapter_source/THIRD_PARTY_NOTICES.md" "$stage/claude-runtime/THIRD_PARTY_NOTICES.md"
 cp -R "$adapter_source/packages/claude/dist" "$adapter_source/packages/claude/node_modules" "$stage/claude-runtime/lib/"
 cp "$adapter_source/packages/claude/package.json" "$adapter_source/packages/claude/package-lock.json" "$adapter_source/LICENSE" "$stage/claude-runtime/lib/"
@@ -38,14 +37,14 @@ cat > "$stage/claude-runtime/bin/codex-harness-adapter-claude" <<'WRAPPER'
 #!/bin/sh
 set -eu
 runtime_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-exec "$runtime_root/bin/node" "$runtime_root/lib/dist/claude/src/adapter.mjs" "$@"
+exec node "$runtime_root/lib/dist/claude/src/adapter.mjs" "$@"
 WRAPPER
-chmod 0755 "$stage/claude-runtime/bin/codex-harness-adapter-claude" "$stage/claude-runtime/bin/node"
+chmod 0755 "$stage/claude-runtime/bin/codex-harness-adapter-claude"
 # 构建验收使用隔离安装的真实固定 CLI，不把它复制进制品，不修改宿主全局安装。
 cli_version=$(node -e 'console.log(require(process.argv[1]).claudeCli)' "$project_root/protocol/versions.json")
 npm install --prefix "$stage/host-cli" --save-exact "@anthropic-ai/claude-code@$cli_version" --no-audit --no-fund
 host_cli="$stage/host-cli/node_modules/.bin/claude"
-env -i PATH=/usr/bin:/bin HOME="$stage/home" CLAUDE_CONFIG_DIR="$stage/home/claude" DISABLE_AUTOUPDATER=1 \
+env -i PATH="$node_dir:/usr/bin:/bin" HOME="$stage/home" CLAUDE_CONFIG_DIR="$stage/home/claude" DISABLE_AUTOUPDATER=1 \
   CHA_CLAUDE_CLI="$host_cli" "$stage/claude-runtime/bin/codex-harness-adapter-claude" --runtime-info > "$stage/claude-runtime/build.json"
 node --input-type=module - "$stage/claude-runtime" "$build_kind" "$adapter_source" <<'JS'
 import {readFileSync,writeFileSync,readdirSync} from 'node:fs'
@@ -53,7 +52,7 @@ import {createHash} from 'node:crypto'
 const [root,kind,source]=process.argv.slice(2)
 const build=JSON.parse(readFileSync(`${root}/build.json`))
 const pin=JSON.parse(readFileSync(`${root}/versions.json`))
-if(build.nodeVersion!==pin.node || build.sdkVersion!==pin.claudeAgentSdk ||
+if(build.nodeVersion.split('.')[0]!==pin.node || build.sdkVersion!==pin.claudeAgentSdk ||
    build.protocolVersion!==pin.codexProtocol || build.cliBuild!==`${pin.claudeCli} (Claude Code)` ||
    !build.cliSha256) throw Error('Claude 制品版本不符合 versions')
 const assertNoNative=(dir)=>{
@@ -77,7 +76,7 @@ build.artifactKind=kind
 build.cliSource='host'
 writeFileSync(`${root}/build.json`,JSON.stringify(build,null,2)+'\n')
 JS
-env -i PATH=/usr/bin:/bin HOME="$stage/home" "$stage/claude-runtime/bin/codex-harness-adapter-claude" --pty-self-check
+env -i PATH="$node_dir:/usr/bin:/bin" HOME="$stage/home" "$stage/claude-runtime/bin/codex-harness-adapter-claude" --pty-self-check
 asset="codex-harness-adapter-claude_${actual_commit}_linux_amd64.tar.gz"
 if [ "$build_kind" = local-acceptance ]; then asset="codex-harness-adapter-claude_${actual_commit}_local_linux_amd64.tar.gz"; fi
 tar -C "$stage" -czf "$artifact_dir/$asset" claude-runtime
@@ -85,12 +84,12 @@ tar -C "$stage" -czf "$artifact_dir/$asset" claude-runtime
 mkdir "$stage/unpacked"
 tar -C "$stage/unpacked" -xzf "$artifact_dir/$asset"
 unpacked="$stage/unpacked/claude-runtime"
-env -i PATH=/usr/bin:/bin HOME="$stage/home" CLAUDE_CONFIG_DIR="$stage/home/claude" DISABLE_AUTOUPDATER=1 \
+env -i PATH="$node_dir:/usr/bin:/bin" HOME="$stage/home" CLAUDE_CONFIG_DIR="$stage/home/claude" DISABLE_AUTOUPDATER=1 \
   CHA_CLAUDE_CLI="$host_cli" "$unpacked/bin/codex-harness-adapter-claude" --runtime-info
-env -i PATH=/usr/bin:/bin HOME="$stage/home" "$unpacked/bin/codex-harness-adapter-claude" --pty-self-check
-(cd "$unpacked/lib" && env -i PATH="$unpacked/bin:/usr/bin:/bin" HOME="$stage/home" \
+env -i PATH="$node_dir:/usr/bin:/bin" HOME="$stage/home" "$unpacked/bin/codex-harness-adapter-claude" --pty-self-check
+(cd "$unpacked/lib" && env -i PATH="$unpacked/bin:$node_dir:/usr/bin:/bin" HOME="$stage/home" \
   CODEX_SCHEMA_DIR="$project_root/protocol/codex-app-server/0.157.1/json-schema" \
-  CHA_CLAUDE_CLI="$host_cli" "$unpacked/bin/node" --test \
+  CHA_CLAUDE_CLI="$host_cli" node --test \
   dist/claude/test/native-image-reference.test.mjs dist/claude/test/mcp-user-config.test.mjs)
 echo 'ARTIFACT PASS: 无原生 SDK 平台包，宿主 CLI 身份、解包启动、PTY、真实 SDK mock 回合'
 echo "$asset"

@@ -287,7 +287,22 @@ createInterface({input:process.stdin}).on('line',line=>{
     assert.equal((await completed(second.turn.id)).params.turn.status, 'completed')
     assert.equal(await readFile(join(cwd, 'result.txt'), 'utf8'), 'written by Pi')
     await ok('desktop', 'thread/name/set', { threadId, name: '原生 Pi 标题' })
-    assert.equal((await call('desktop', 'thread/archive', { threadId })).error.code, -32601)
+    // 归档只改变适配器列表状态：默认列表隐藏，archived=true 可见，取消归档后恢复。
+    const listed = async (params: any = {}) =>
+      (await ok('desktop', 'thread/list', params)).data.map((t: any) => t.id)
+    assert.deepEqual(await ok('desktop', 'thread/archive', { threadId }), {})
+    await wait('desktop', (m) => m.method === 'thread/archived' && m.params.threadId === threadId)
+    assert.ok(!(await listed()).includes(threadId))
+    assert.ok(!(await listed({ archived: false })).includes(threadId))
+    assert.ok((await listed({ archived: true })).includes(threadId))
+    assert.equal((await ok('desktop', 'thread/unarchive', { threadId })).thread.id, threadId)
+    await wait('desktop', (m) => m.method === 'thread/unarchived' && m.params.threadId === threadId)
+    assert.ok((await listed()).includes(threadId))
+    assert.ok(!(await listed({ archived: true })).includes(threadId))
+    assert.equal(
+      (await call('desktop', 'thread/archive', { threadId: 'missing' })).error.code,
+      -32602,
+    )
     const before = (await ok('desktop', 'thread/read', { threadId, includeTurns: true })).thread
     const change = before.turns
       .find((t: any) => t.id === second.turn.id)

@@ -253,12 +253,14 @@ export async function dispatch(s: PiServer, peer: RpcPeer, method: string, p: an
       if (p.parentThreadId && p.ancestorThreadId)
         throw new ProtocolError(-32602, 'parentThreadId 与 ancestorThreadId 不能同时使用')
       await s.index(p.cwd)
-      if (p.archived === true) return { data: [], nextCursor: null }
+      // archived 为 true 只列已归档会话；false、null 或省略只列未归档会话。
+      const archived = s.store.archivedIds()
       const threads = s.store.threads()
       const byId = new Map(threads.map((thread) => [thread.id, thread]))
       const rows = threads.filter(
         (t) =>
           !t.ephemeral &&
+          archived.has(t.id) === (p.archived === true) &&
           (p.parentThreadId ? t.parentThreadId === p.parentThreadId : true) &&
           (p.ancestorThreadId ? s.ancestors(t, byId).includes(p.ancestorThreadId) : true) &&
           (p.sourceKinds?.length
@@ -276,7 +278,7 @@ export async function dispatch(s: PiServer, peer: RpcPeer, method: string, p: an
       return pageRecords(
         rows.map((t) => s.envelope(t, false, byId)),
         p,
-        `threads:${JSON.stringify([p.projectId !== undefined, p.projectId, p.sectionId !== undefined, p.sectionId, p.isPinned, p.cwd, p.parentThreadId, p.ancestorThreadId, p.sourceKinds, p.searchTerm])}`,
+        `threads:${JSON.stringify([p.archived === true, p.projectId !== undefined, p.projectId, p.sectionId !== undefined, p.sectionId, p.isPinned, p.cwd, p.parentThreadId, p.ancestorThreadId, p.sourceKinds, p.searchTerm])}`,
         (t) => t.id,
       )
     }
@@ -462,8 +464,19 @@ export async function dispatch(s: PiServer, peer: RpcPeer, method: string, p: an
       return s.searches.stop(p)
     case 'gitDiffToRemote':
       return gitDiffToRemote(p.cwd ?? process.cwd())
-    case 'thread/archive':
-    case 'thread/unarchive':
+    case 'thread/archive': {
+      const thread = s.store.thread(p.threadId)
+      if (s.active.has(thread.id)) await s.interrupt(thread.id)
+      s.store.setArchived(thread.id, true)
+      s.notify(thread.id, 'thread/archived', {})
+      return {}
+    }
+    case 'thread/unarchive': {
+      const thread = s.store.thread(p.threadId)
+      s.store.setArchived(thread.id, false)
+      s.notify(thread.id, 'thread/unarchived', {})
+      return { thread: s.envelope(thread, false) }
+    }
     case 'review/start':
       throw new ProtocolError(-32601, `Pi 首期不支持 ${method}`)
     case 'mcpServerStatus/list':

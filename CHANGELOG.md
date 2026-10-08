@@ -5,6 +5,11 @@ The project is still private in `package.json`; this file tracks release notes
 for maintainers preparing the next public release and does not change package
 versioning or publishing metadata.
 
+## 0.4.2
+
+- Pi 支持 `thread/archive` / `thread/unarchive`：归档只改变适配器侧列表状态，不改动 Pi 原生会话文件；
+  `thread/list` 按 `archived` 过滤，归档活动会话会先中断当前回合。
+
 ## 0.4.1
 
 - CLI 启动时读取 `~/.codex-harness-adapter/env`（每行 `KEY=VALUE`），后台服务也可配置

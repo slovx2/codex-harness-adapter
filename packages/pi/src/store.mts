@@ -72,6 +72,19 @@ export class PiStore {
     if (!row) throw new ProtocolError(-32602, '未知 Pi 会话')
     return JSON.parse(String(row.data))
   }
+  // 归档是适配器侧的界面状态，不改动 Pi 原生会话文件。
+  archivedIds(): Set<string> {
+    return new Set(
+      this.db
+        .prepare('SELECT id FROM threads WHERE archived=1')
+        .all()
+        .map((r) => String(r.id)),
+    )
+  }
+  setArchived(id: string, archived: boolean): void {
+    this.thread(id)
+    this.db.prepare('UPDATE threads SET archived=? WHERE id=?').run(Number(archived), id)
+  }
   saveThread(thread: PiThread): void {
     this.db
       .prepare(`INSERT INTO threads(id,data,updated_at,ephemeral) VALUES(?,?,?,?)

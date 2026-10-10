@@ -1,7 +1,7 @@
 import { readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { getAgentDir, SettingsManager } from '@earendil-works/pi-coding-agent'
+import { getAgentDir, SettingsManager } from './sdk.mjs'
 
 export function sessionDirectory(cwd: string): string | undefined {
   const directory = process.env.PI_CODING_AGENT_SESSION_DIR

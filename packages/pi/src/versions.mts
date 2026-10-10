@@ -3,26 +3,42 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { isVersionAtLeast } from '../../shared/src/min-version.mjs'
 import { CODEX_PROTOCOL_VERSION } from '../../shared/src/runtime-version.mjs'
+import { type HostPi, locateHostPi } from './host-pi.mjs'
 
 export const versions = {
   protocol: CODEX_PROTOCOL_VERSION,
   node: '24.0.0',
-  sdk: '0.99.1',
   cli: '0.99.1',
   plan: '0.58.3',
   tuiKit: '0.59.0',
   subagents: '21.8.1',
 } as const
 
+// 对用户安装的 Pi 只设下限；SDK 与 CLI 同属一个包，一次校验覆盖两者。
+export function requireMinimumPi(pi: HostPi): HostPi {
+  if (!isVersionAtLeast(pi.version, versions.cli))
+    throw new Error(
+      `需要用户安装的 Pi CLI >= ${versions.cli}，实际 ${pi.version}；请升级 Pi，或用 PI_CLI 指定路径`,
+    )
+  return pi
+}
+
+let host: HostPi | undefined
+export function hostPi(): HostPi {
+  host ??= requireMinimumPi(locateHostPi())
+  return host
+}
+
 export function runtimeInfo() {
+  const pi = hostPi()
   const installed = installedVersions()
   validateInstalledVersions(installed)
   return {
     engine: 'pi',
     protocolVersion: versions.protocol,
     nodeVersion: process.versions.node,
-    sdkVersion: installed['@earendil-works/pi-coding-agent'],
-    cliBuild: versions.cli,
+    sdkVersion: pi.version,
+    cliBuild: pi.version,
     pluginVersions: {
       '@narumitw/pi-plan-mode': installed['@narumitw/pi-plan-mode'],
       '@gotgenes/pi-subagents': installed['@gotgenes/pi-subagents'],
@@ -40,8 +56,8 @@ export function runtimeInfo() {
   }
 }
 
+// 随适配器分发的插件；Pi 本体不在其中。
 const expectedPackages: Record<string, string> = {
-  '@earendil-works/pi-coding-agent': versions.sdk,
   '@narumitw/pi-plan-mode': versions.plan,
   '@narumitw/pi-tui-kit': versions.tuiKit,
   '@gotgenes/pi-subagents': versions.subagents,

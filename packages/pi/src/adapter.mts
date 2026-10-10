@@ -2,7 +2,7 @@
 import { spawnSync } from 'node:child_process'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { cliCommand, resolveHostCli } from '../../shared/src/host-cli.mjs'
+import { cliCommand } from '../../shared/src/host-cli.mjs'
 import { isVersionAtLeast } from '../../shared/src/min-version.mjs'
 import { ProcessRpc } from '../../shared/src/process-rpc.mjs'
 import { codexCliVersion } from '../../shared/src/runtime-version.mjs'
@@ -14,8 +14,7 @@ import {
   startWebSocketTransport,
 } from '../../shared/src/transports.mjs'
 import type { RpcPeer } from '../../shared/src/types.mjs'
-import { PiServer } from './server.mjs'
-import { runtimeInfo, validateInstalledVersions, versions } from './versions.mjs'
+import { hostPi, runtimeInfo, validateInstalledVersions, versions } from './versions.mjs'
 
 async function main(): Promise<void> {
   validateInstalledVersions()
@@ -25,21 +24,19 @@ async function main(): Promise<void> {
     return
   }
   if (args[0] === '--runtime-info') {
-    const executable = resolveHostCli(
-      process.env.PI_CLI ?? 'pi',
-      '@earendil-works/pi-coding-agent',
-      'dist/cli.js',
-    )
-    const [command, ...cliArgs] = cliCommand(executable, ['--version'])
+    if (!isVersionAtLeast(process.versions.node, versions.node))
+      throw new Error(`需要 Node >= ${versions.node}`)
+    const info = runtimeInfo()
+    // 实际加载一次，接口不兼容的 Pi 在检测阶段就报出来，而不是等到启动后崩溃。
+    await import('./sdk.mjs')
+    const [command, ...cliArgs] = cliCommand(hostPi().cli, ['--version'])
     const cli = spawnSync(command!, cliArgs, {
       encoding: 'utf8',
       timeout: 10000,
     })
     if (cli.error || cli.status !== 0 || !isVersionAtLeast(cli.stdout.trim(), versions.cli))
       throw new Error(`需要用户安装的 Pi CLI >= ${versions.cli}；可用 PI_CLI 指定路径`)
-    if (!isVersionAtLeast(process.versions.node, versions.node))
-      throw new Error(`需要 Node >= ${versions.node}`)
-    process.stdout.write(`${JSON.stringify({ ...runtimeInfo(), cliBuild: cli.stdout.trim() })}\n`)
+    process.stdout.write(`${JSON.stringify({ ...info, cliBuild: cli.stdout.trim() })}\n`)
     return
   }
   if (args[0] === '--pty-self-check') {
@@ -59,6 +56,8 @@ async function main(): Promise<void> {
     listenIndex < 0 ? 'stdio://' : (args[listenIndex + 1] ?? 'stdio://'),
   )
   if (listen === 'off') return
+  // 加载用户安装的 Pi 可能失败；放在入口内部，错误只输出可操作的提示，--version 也不依赖 Pi。
+  const { PiServer } = await import('./server.mjs')
   const server = new PiServer(
     resolve(process.env.CHA_PI_HOME ?? join(homedir(), '.codex-harness-adapter/pi')),
   )

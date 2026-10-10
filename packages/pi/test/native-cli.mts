@@ -1,13 +1,12 @@
 import { spawn } from 'node:child_process'
 import { dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { cliCommand } from '../../shared/src/host-cli.mjs'
+import { hostPi } from '../src/versions.mjs'
 
-// 启动真实官方 CLI，只传临时配置和必要环境；不继承宿主模型凭据。
+// 启动与适配器同一份的真实官方 CLI，只传临时配置和必要环境；不继承宿主模型凭据。
 export async function continueWithCli(path: string, cwd: string, agentDir: string): Promise<void> {
-  const cli = fileURLToPath(
-    new URL('./cli.js', import.meta.resolve('@earendil-works/pi-coding-agent')),
-  )
-  const child = spawn(process.execPath, [cli, '--mode', 'rpc', '--session', path], {
+  const [command, ...args] = cliCommand(hostPi().cli, ['--mode', 'rpc', '--session', path])
+  const child = spawn(command!, args, {
     cwd,
     env: { PATH: process.env.PATH ?? '', HOME: dirname(agentDir), PI_CODING_AGENT_DIR: agentDir },
     stdio: ['pipe', 'pipe', 'pipe'],

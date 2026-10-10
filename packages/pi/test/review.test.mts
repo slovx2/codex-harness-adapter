@@ -5,10 +5,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { SessionManager } from '@earendil-works/pi-coding-agent'
 import { NativeFiles, sessionDirectory } from '../src/native-files.mjs'
 import { finishTool, projectHistory } from '../src/projection.mjs'
 import { dispatch } from '../src/protocol.mjs'
+import { SessionManager } from '../src/sdk.mjs'
 import { PiServer } from '../src/server.mjs'
 import type { PiThread } from '../src/store.mjs'
 import { installedVersions, validateInstalledVersions } from '../src/versions.mjs'
@@ -180,7 +180,7 @@ test('原生索引按文件状态缓存，设置使用官方 sessionDir', async 
   }
 })
 
-test('诊断读取实际包版本，接受更高版本，拒绝 SDK 与每个插件低于下限', () => {
+test('诊断读取实际包版本，接受更高版本，拒绝每个随适配器分发的插件低于下限', () => {
   const installed = installedVersions()
   validateInstalledVersions(installed)
   for (const name of Object.keys(installed)) {

@@ -1,5 +1,6 @@
 #!/bin/sh
 # 默认只构建 versions 固定的干净提交；本地验收必须显式声明。
+# 制品只含适配器与随附插件；Node 24 与 Pi 均来自宿主独立安装，版本由 versions 校验。
 set -eu
 adapter_source=${1:?需要适配器源码目录}
 artifact_dir=${2:?需要制品输出目录}
@@ -23,14 +24,16 @@ test "$(uname -s)-$(uname -m)" = 'Linux-x86_64'
 npm ci --prefix "$adapter_source" --no-audit --no-fund
 npm ci --prefix "$adapter_source/packages/pi" --no-audit --no-fund
 npm run build --prefix "$adapter_source/packages/pi"
+# 开发依赖里的 Pi 本体只用于类型与测试，不进入制品。
+npm prune --omit=dev --prefix "$adapter_source/packages/pi" --no-audit --no-fund
 stage=$(mktemp -d)
 trap 'rm -r -- "$stage"' EXIT HUP INT TERM
 runtime="$stage/pi-runtime"
 mkdir -p "$runtime/bin" "$runtime/lib/scripts" "$stage/home"
 cp "$adapter_source/THIRD_PARTY_NOTICES.md" "$runtime/THIRD_PARTY_NOTICES.md"
 cp -R "$adapter_source/packages/pi/dist" "$adapter_source/packages/pi/node_modules" "$runtime/lib/"
-node "$project_root/scripts/pi-runtime-platforms.mjs" prune "$runtime/lib/node_modules"
-node "$project_root/scripts/pi-runtime-platforms.mjs" check "$runtime/lib/node_modules"
+# prune 会留下空的作用域目录，按内容判断。
+test -z "$(ls -A "$runtime/lib/node_modules/@earendil-works" 2>/dev/null)" || { echo '制品不应包含 Pi 本体' >&2; exit 1; }
 cp "$adapter_source/packages/pi/package.json" "$adapter_source/packages/pi/package-lock.json" "$runtime/lib/"
 cp "$adapter_source/LICENSE" "$runtime/"
 cp "$project_root/protocol/versions.json" "$runtime/versions.json"
@@ -43,13 +46,11 @@ runtime_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 exec node "$runtime_root/lib/dist/pi/src/adapter.mjs" "$@"
 WRAPPER
 chmod 0755 "$runtime/bin/codex-harness-adapter-pi"
-# 仅用构建依赖中的真实官方 CLI 检查版本；不安装、复制用户全局 CLI。
-cat > "$stage/pi-test-cli" <<'WRAPPER'
-#!/bin/sh
-exec node "$PI_TEST_RUNTIME/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js" "$@"
-WRAPPER
-chmod 0755 "$stage/pi-test-cli"
-env -i PATH="$node_dir:/usr/bin:/bin" HOME="$stage/home" PI_CLI="$stage/pi-test-cli" PI_TEST_RUNTIME="$runtime" \
+# 构建验收使用隔离安装的真实固定 Pi，不把它复制进制品，不修改宿主全局安装。
+cli_version=$(node -e 'console.log(require(process.argv[1]).piCli)' "$project_root/protocol/versions.json")
+npm install --prefix "$stage/host-cli" --save-exact "@earendil-works/pi-coding-agent@$cli_version" --no-audit --no-fund
+host_cli="$stage/host-cli/node_modules/.bin/pi"
+env -i PATH="$node_dir:/usr/bin:/bin" HOME="$stage/home" PI_CLI="$host_cli" \
   "$runtime/bin/codex-harness-adapter-pi" --runtime-info > "$runtime/build.json"
 env -i PATH="$node_dir:/usr/bin:/bin" HOME="$stage/home" "$runtime/bin/codex-harness-adapter-pi" --pty-self-check
 test ! -d "$runtime/lib/node_modules/@anthropic-ai/claude-agent-sdk"
@@ -70,6 +71,7 @@ info.lockSha256=createHash('sha256').update(readFileSync(`${root}/lib/package-lo
 info.target='linux-amd64'
 info.artifactKind=process.argv[4]
 info.adapterCommit=process.argv[5]
+info.cliSource='host'
 const hash=createHash('sha256')
 for(const directory of ['packages/pi/src','packages/shared/src']) {
   for(const file of readdirSync(`${source}/${directory}`).filter(name=>name.endsWith('.mts')).sort()) {
@@ -85,9 +87,8 @@ tar -C "$stage" -czf "$artifact_dir/$asset" pi-runtime
 (cd "$artifact_dir" && sha256sum "$asset" > "$asset.sha256")
 mkdir "$stage/unpacked"
 tar -C "$stage/unpacked" -xzf "$artifact_dir/$asset"
-node "$project_root/scripts/pi-runtime-platforms.mjs" check "$stage/unpacked/pi-runtime/lib/node_modules"
-env -i PATH="$node_dir:/usr/bin:/bin" HOME="$stage/home" PI_CLI="$stage/pi-test-cli" PI_TEST_RUNTIME="$stage/unpacked/pi-runtime" \
+env -i PATH="$node_dir:/usr/bin:/bin" HOME="$stage/home" PI_CLI="$host_cli" \
   "$stage/unpacked/pi-runtime/bin/codex-harness-adapter-pi" --runtime-info
 env -i PATH="$node_dir:/usr/bin:/bin" HOME="$stage/home" "$stage/unpacked/pi-runtime/bin/codex-harness-adapter-pi" --pty-self-check
-node "$adapter_source/packages/pi/test/artifact-smoke.mjs" "$stage/unpacked/pi-runtime"
+PI_CLI="$host_cli" node "$adapter_source/packages/pi/test/artifact-smoke.mjs" "$stage/unpacked/pi-runtime"
 echo "$artifact_dir/$asset"

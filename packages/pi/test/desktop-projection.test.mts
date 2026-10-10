@@ -233,3 +233,86 @@ test('置顶分组使用桌面固定 ID，thread/list 按 sectionId 与 isPinned
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('model/list 的默认思考强度取 Pi 对该模型实际生效的值，一定在可选项内', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-model-effort-'))
+  const agentDir = join(root, 'agent')
+  const previous = process.env.PI_CODING_AGENT_DIR
+  process.env.PI_CODING_AGENT_DIR = agentDir
+  await mkdir(agentDir, { recursive: true })
+  const model = (id: string, extra: object) => ({
+    id,
+    name: id,
+    input: ['text'],
+    contextWindow: 32000,
+    maxTokens: 1024,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    ...extra,
+  })
+  // sparse 与 high-only 沿用 DeepSeek 两个模型的强度映射：都不支持 medium。
+  const levels = { minimal: null, medium: null, high: 'high', max: 'max' }
+  await writeFile(
+    join(agentDir, 'models.json'),
+    JSON.stringify({
+      providers: {
+        local: {
+          baseUrl: 'http://127.0.0.1:9/v1',
+          api: 'openai-completions',
+          apiKey: 'test-only',
+          models: [
+            model('sparse', { reasoning: true, thinkingLevelMap: { ...levels, low: 'low' } }),
+            model('high-only', { reasoning: true, thinkingLevelMap: { ...levels, low: null } }),
+            model('full', { reasoning: true }),
+            model('plain', { reasoning: false }),
+          ],
+        },
+      },
+    }),
+  )
+  const server = new PiServer(join(root, 'adapter'))
+  const peer = { id: 'p', send() {}, close() {} }
+  const call = async (method: string, params: any) => {
+    const result = await dispatch(server, peer, method, params)
+    assertResponse(method, result)
+    return result
+  }
+  const defaults = async () => {
+    const listed = (await call('model/list', { cwd: root })).data
+    return Object.fromEntries(
+      listed
+        .filter((m: any) => m.id.startsWith('local/'))
+        .map((m: any) => {
+          const options = m.supportedReasoningEfforts.map((e: any) => e.reasoningEffort)
+          assert.ok(options.includes(m.defaultReasoningEffort), `${m.id}: ${options}`)
+          return [m.id.slice('local/'.length), m.defaultReasoningEffort]
+        }),
+    )
+  }
+  try {
+    assert.deepEqual(await defaults(), {
+      sparse: 'high',
+      'high-only': 'high',
+      full: 'medium',
+      plain: 'off',
+    })
+    // 列表给出的默认值就是新会话实际生效的强度。
+    const started = await call('thread/start', { cwd: root, model: 'local/sparse' })
+    assert.equal(started.reasoningEffort, 'high')
+    // 设置里的默认强度优先，仍钳制到各模型支持的范围。
+    await writeFile(
+      join(agentDir, 'settings.json'),
+      JSON.stringify({ defaultThinkingLevel: 'low' }),
+    )
+    assert.deepEqual(await defaults(), {
+      sparse: 'low',
+      'high-only': 'high',
+      full: 'low',
+      plain: 'off',
+    })
+  } finally {
+    await server.close()
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR
+    else process.env.PI_CODING_AGENT_DIR = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})

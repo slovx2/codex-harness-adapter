@@ -1,25 +1,20 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import {
-  type AgentSession,
-  createAgentSession,
-  createEventBus,
-  DefaultResourceLoader,
-  type ExtensionUIContext,
-  getAgentDir,
-  SessionManager,
-  SettingsManager,
-} from '@earendil-works/pi-coding-agent'
+import type { AgentSession, ExtensionUIContext } from '@earendil-works/pi-coding-agent'
 import { ProtocolError } from '../../shared/src/protocol-contract.mjs'
 import { type ClientTool, clientToolContent, clientTools } from './dynamic-tools.mjs'
 import { sessionDirectory } from './native-files.mjs'
+import {
+  builtInExtensions,
+  createAgentSession,
+  createEventBus,
+  DefaultResourceLoader,
+  getAgentDir,
+  SessionManager,
+  SettingsManager,
+} from './sdk.mjs'
 import type { PiThread } from './store.mjs'
-
-// 固定版本直接使用 CLI 的同一份清单，包括可替换规则与 llama.cpp。
-const { builtInExtensions } = await import(
-  new URL('./extensions/index.js', import.meta.resolve('@earendil-works/pi-coding-agent')).href
-)
 
 export interface SessionHost {
   ui: ExtensionUIContext

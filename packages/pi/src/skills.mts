@@ -1,11 +1,6 @@
 import { dirname, isAbsolute } from 'node:path'
-import {
-  DefaultResourceLoader,
-  getAgentDir,
-  loadSkills,
-  SettingsManager,
-} from '@earendil-works/pi-coding-agent'
 import { ProtocolError } from '../../shared/src/protocol-contract.mjs'
+import { DefaultResourceLoader, getAgentDir, loadSkills, SettingsManager } from './sdk.mjs'
 
 export async function skillsAt(
   cwd: string,

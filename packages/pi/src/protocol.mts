@@ -1,13 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { unlink } from 'node:fs/promises'
 import { isAbsolute, join } from 'node:path'
-import { getSupportedThinkingLevels } from '@earendil-works/pi-ai'
-import {
-  getAgentDir,
-  ModelRuntime,
-  SessionManager,
-  SettingsManager,
-} from '@earendil-works/pi-coding-agent'
 import { gitDiffToRemote } from '../../shared/src/git-diff-remote.mjs'
 import { projectRequest } from '../../shared/src/project-rpc.mjs'
 import {
@@ -25,6 +18,14 @@ import { metadataRequest } from './metadata.mjs'
 import { sessionDirectory } from './native-files.mjs'
 import { projectHistory, textContent } from './projection.mjs'
 import { planState } from './runtime.mjs'
+import {
+  clampThinkingLevel,
+  getAgentDir,
+  getSupportedThinkingLevels,
+  ModelRuntime,
+  SessionManager,
+  SettingsManager,
+} from './sdk.mjs'
 import type { PiServer } from './server.mjs'
 import { skillsAt, writeSkill } from './skills.mjs'
 import type { PiThread } from './store.mjs'
@@ -130,7 +131,11 @@ export async function dispatch(s: PiServer, peer: RpcPeer, method: string, p: an
             reasoningEffort,
             description: reasoningEffort,
           })),
-          defaultReasoningEffort: m.reasoning ? 'medium' : 'off',
+          // 新会话实际生效的强度：Pi 把设置里的默认强度钳制到模型支持的范围，不一定是 medium。
+          defaultReasoningEffort: clampThinkingLevel(
+            m,
+            settings.getDefaultThinkingLevel() ?? 'medium',
+          ),
           inputModalities: m.input,
           supportsPersonality: false,
           upgrade: null,

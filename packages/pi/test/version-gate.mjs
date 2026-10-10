@@ -8,8 +8,10 @@ const root = await mkdtemp(join(tmpdir(), 'codex-harness-adapter-pi-runtime-'))
 const agentDir = join(root, 'agent')
 await mkdir(agentDir)
 process.env.PI_CODING_AGENT_DIR = agentDir
+// 验证随适配器分发的插件与"用户安装的 Pi"的组合：默认是开发依赖里的基线，PI_CLI 可改测其他版本。
+await import('../dist/pi/test/setup.mjs')
 const { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager } = await import(
-  '@earendil-works/pi-coding-agent'
+  '../dist/pi/src/sdk.mjs'
 )
 const replies = []
 const requests = []

@@ -1,4 +1,5 @@
 // 从解包后的独立制品运行；不依赖源码、开发依赖或宿主模型凭据。
+// 制品不含 Pi 本体，PI_CLI 必须指向宿主安装的 Pi。
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
@@ -8,6 +9,7 @@ import { join, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 
 const runtime = resolve(process.argv[2])
+assert.ok(process.env.PI_CLI, '需要 PI_CLI 指向宿主安装的 Pi')
 const root = await mkdtemp(join(tmpdir(), 'pi-artifact-'))
 const home = join(root, 'home'),
   agent = join(home, '.pi', 'agent'),
@@ -115,6 +117,7 @@ try {
       PATH: '/usr/bin:/bin',
       HOME: home,
       PI_CODING_AGENT_DIR: agent,
+      PI_CLI: process.env.PI_CLI,
       CHA_PI_HOME: join(root, 'state'),
     },
     stdio: ['pipe', 'pipe', 'pipe'],

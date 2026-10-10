@@ -4,19 +4,18 @@
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=24.14.0"
+    "node": ">=24.0.0"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "0.99.1",
-    "@earendil-works/pi-ai": "0.99.1",
-    "@earendil-works/pi-coding-agent": "0.99.1",
-    "@earendil-works/pi-tui": "0.99.1",
     "@gotgenes/pi-subagents": "21.8.1",
     "@narumitw/pi-plan-mode": "0.58.3",
     "@narumitw/pi-tui-kit": "0.59.0",
     "diff": "8.0.4",
-    "typebox": "1.3.27",
     "ws": "8.21.3"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.99.1",
+    "@earendil-works/pi-coding-agent": "0.99.1"
   },
   "overrides": {
     "@earendil-works/pi-coding-agent": "0.99.1",
@@ -27,11 +26,11 @@
     "typebox": "1.3.27"
   },
   "scripts": {
-    "test:version-gate": "node test/version-gate.mjs",
+    "test:version-gate": "npm run build && node test/version-gate.mjs",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "check": "biome check src test ../shared/src",
     "start": "node dist/pi/src/adapter.mjs",
-    "test": "npm run build && cd ../.. && node --test packages/pi/dist/pi/test/*.test.mjs"
+    "test": "npm run build && cd ../.. && node --import ./packages/pi/dist/pi/test/setup.mjs --test packages/pi/dist/pi/test/*.test.mjs"
   }
 }

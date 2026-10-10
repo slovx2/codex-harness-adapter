@@ -9,5 +9,7 @@
   "piPlanMode": "0.58.3",
   "piTuiKit": "0.59.0",
   "piSubagents": "21.8.1",
+  "dshMinimum": "0.2.0-rc.2",
+  "dshVerified": ["0.2.0-rc.2"],
   "releaseReady": false
 }

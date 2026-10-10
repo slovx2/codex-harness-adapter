@@ -63,9 +63,14 @@ else console.log('pty-self-check ok');`
 func TestDiagnosticFailuresRemainActionable(t *testing.T) {
 	for _, scenario := range []struct{ name, fixture, message string }{
 		{"missing-cli", `console.error('Error: 宿主 CLI 不可执行或未找到: pi\n    at internal INTERNAL_DETAIL'); process.exit(1);`, "未找到可用的引擎 CLI"},
+		{"standalone-pi", `console.error('无法从 /opt/pi 定位 Pi 的 npm 包 INTERNAL_DETAIL'); process.exit(1);`, "通过 npm 完整安装的 Pi"},
+		{"incompatible-pi", `console.error('用户安装的 Pi 9.0.0 与适配器不兼容（缺少 createEventBus）INTERNAL_DETAIL'); process.exit(1);`, "请升级适配器"},
 		{"invalid-response", `console.log('INTERNAL_DETAIL invalid JSON');`, "检查结果无效"},
 		{"unexpected-error", `console.error('Error: INTERNAL_DETAIL\n    at internal'); process.exit(1);`, "重新安装和构建"},
 		{"old-cli", `console.error('需要用户安装的 Pi CLI >= 0.99.1 INTERNAL_DETAIL'); process.exit(1);`, "最低稳定版本"},
+		{"missing-dsh", `console.error('Error: 宿主 dsh CLI 不可执行或未找到: dsh INTERNAL_DETAIL'); process.exit(1);`, "CHA_DSH_CLI"},
+		{"old-dsh", `console.error('宿主 dsh CLI 版本不符: 需要 >= 0.2.0-rc.2，实际 0.1.5 INTERNAL_DETAIL'); process.exit(1);`, "DeepSeek Harness 版本低于"},
+		{"broken-dsh", `console.error('无法读取宿主 dsh CLI 版本: /opt/dsh INTERNAL_DETAIL'); process.exit(1);`, "dsh --version"},
 		{"old-node", `console.error('INTERNAL_DETAIL'); console.log(JSON.stringify({engine:'pi',protocolVersion:'0.157.1',nodeVersion:'22.23.1'}));`, "Node.js 版本过低"},
 		{"sandbox", `console.error('Claude 沙箱依赖不可用: bwrap INTERNAL_DETAIL'); process.exit(1);`, "沙箱依赖不可用"},
 	} {

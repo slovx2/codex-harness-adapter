@@ -20,6 +20,10 @@ plain `.mjs` / shell.
 - `acceptance-*.mjs` — end-to-end checks (local-remote, gui-ssh-localhost,
   ssh-runtime-matrix); transcripts land under git-ignored `.codex-harness-adapter/`.
 - `probe-*.mjs` — capability / codex-cli-remote probes.
+- `dsh-poc-serve.mjs` — isolated DeepSeek Harness entry (workspace CLI, loopback
+  mock model, own state dir and port, loopback-only sandbox). `--verify` runs the
+  protocol-level check over real SSH (`npm run test:dsh-ssh`); `--gui` keeps it up
+  for the desktop app. Needs a user-installed `dsh` (`CHA_DSH_CLI` or `PATH`).
 
 ## Conventions
 

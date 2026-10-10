@@ -81,7 +81,15 @@ func runDiagnostic(ctx context.Context, c configuration, flag string) ([]byte, e
 	case flag == "--pty-self-check":
 		message = "终端检查失败，请检查系统终端依赖；Windows 需要 Git for Windows，macOS/Linux 需要 Python 3"
 	case strings.Contains(stderr.String(), "CLI 不可执行或未找到"):
-		message = "未找到可用的引擎 CLI，请安装后重开终端，或通过 CHA_CLAUDE_CLI / PI_CLI 指定路径"
+		message = "未找到可用的引擎 CLI，请安装后重开终端，或通过 CHA_CLAUDE_CLI / PI_CLI / CHA_DSH_CLI 指定路径"
+	case strings.Contains(stderr.String(), "定位 Pi 的 npm 包"), strings.Contains(stderr.String(), "用户安装的 Pi 缺少依赖"):
+		message = "无法加载用户安装的 Pi：Pi 入口需要通过 npm 完整安装的 Pi（独立二进制不可用），请用 npm 安装后重试，或通过 PI_CLI 指定 npm 包内的 CLI"
+	case strings.Contains(stderr.String(), "与适配器不兼容"):
+		message = "用户安装的 Pi 与当前适配器不兼容，请升级适配器，或通过 PI_CLI 指定受支持的 Pi 版本"
+	case strings.Contains(stderr.String(), "dsh CLI 版本不符"):
+		message = "DeepSeek Harness 版本低于适配器要求的下限，请升级 dsh 后重试"
+	case strings.Contains(stderr.String(), "无法读取宿主 dsh CLI 版本"):
+		message = "无法读取 DeepSeek Harness 版本，请先确认 dsh --version 可以正常运行"
 	case strings.Contains(stderr.String(), "Claude CLI 版本不符"), strings.Contains(stderr.String(), "需要用户安装的 Pi CLI"):
 		message = "引擎 CLI 版本检查未通过，请安装 README 要求的最低稳定版本或更高版本"
 	case strings.Contains(stderr.String(), "无法读取宿主 Claude CLI 版本"):

@@ -25,10 +25,10 @@
     "CONTRIBUTING.md"
   ],
   "scripts": {
-    "setup": "npm ci && npm ci --prefix packages/claude && npm ci --prefix packages/pi && npm run build",
+    "setup": "npm ci && npm ci --prefix packages/claude && npm ci --prefix packages/pi && npm ci --prefix packages/dsh && npm run build",
     "dev": "tsx packages/claude/src/adapter.mts",
-    "build": "npm run build --prefix packages/claude && npm run build --prefix packages/pi && node scripts/build-cli.mjs",
-    "typecheck": "npm run typecheck --prefix packages/claude && npm run typecheck --prefix packages/pi",
+    "build": "npm run build --prefix packages/claude && npm run build --prefix packages/pi && npm run build --prefix packages/dsh && node scripts/build-cli.mjs",
+    "typecheck": "npm run typecheck --prefix packages/claude && npm run typecheck --prefix packages/pi && npm run typecheck --prefix packages/dsh",
     "lint": "biome lint packages scripts",
     "format": "biome format --write packages scripts",
     "check": "biome check packages scripts",
@@ -51,7 +51,9 @@
     "start": "node scripts/run-cli.mjs start",
     "generate:schema": "codex app-server generate-ts --experimental --out generated/codex-app-server",
     "test:protocol": "npm run build && node scripts/test-protocol.mjs",
-    "test:local-ssh": "node scripts/test-local-ssh.mjs"
+    "test:local-ssh": "node scripts/test-local-ssh.mjs",
+    "test:dsh": "npm run test --prefix packages/dsh",
+    "test:dsh-ssh": "npm run build --prefix packages/dsh && node scripts/dsh-poc-serve.mjs --verify"
   },
   "dependencies": {
     "ajv": "8.20.0",

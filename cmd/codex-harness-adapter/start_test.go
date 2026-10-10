@@ -16,7 +16,7 @@ import (
 )
 
 func TestStartOptions(t *testing.T) {
-	for _, args := range [][]string{{"--port", "7333"}, {"--pi-port", "7331"}, {"--claude-port", "-1"}} {
+	for _, args := range [][]string{{"--port", "7333"}, {"--pi-port", "7331"}, {"--claude-port", "-1"}, {"--dsh-port", "7331"}, {"--dsh-port", "0"}} {
 		if _, err := parseConfiguration(args); err == nil {
 			t.Fatalf("接受歧义或冲突端口: %v", args)
 		}
@@ -32,6 +32,12 @@ func TestStartOptions(t *testing.T) {
 	cfg, err = parseConfiguration([]string{"--harness", "pi", "--port", "7443"})
 	if err != nil || len(cfg.entries()) != 1 || cfg.entries()[0].port != 7443 {
 		t.Fatalf("单引擎端口错误: %+v %v", cfg, err)
+	}
+	// 单独启动 dsh 时默认端口与另外两个入口错开。
+	cfg, err = parseConfiguration([]string{"--harness", "dsh"})
+	if err != nil || len(cfg.entries()) != 1 || cfg.entries()[0].port != 7333 ||
+		!strings.HasSuffix(cfg.adapter(), filepath.Join("packages", "dsh", "dist", "dsh", "src", "adapter.mjs")) {
+		t.Fatalf("dsh 入口配置错误: %+v %v", cfg, err)
 	}
 }
 

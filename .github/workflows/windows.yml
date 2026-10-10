@@ -18,6 +18,7 @@ jobs:
       - run: npm ci --no-audit --no-fund
       - run: npm ci --prefix packages/claude --no-audit --no-fund
       - run: npm ci --prefix packages/pi --no-audit --no-fund
+      - run: npm ci --prefix packages/dsh --no-audit --no-fund
       - name: 隔离的官方 CLI 与 Git Bash
         run: |
           npm install --prefix .artifacts/host-cli --save-exact @anthropic-ai/claude-code@2.1.282 --no-audit --no-fund

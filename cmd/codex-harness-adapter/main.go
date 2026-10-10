@@ -19,6 +19,7 @@ type configuration struct {
 	harness, home, root, node string
 	port                      int
 	claudePort, piPort        int
+	dshPort                   int
 	userEnv                   map[string]string
 }
 
@@ -36,7 +37,7 @@ func main() {
 
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
-		fmt.Println("用法: codex-harness-adapter start|init|serve|ssh-config|doctor [选项]\nstart: 自动初始化并启动可用的 Claude Code 和 Pi；可用 --harness claude-code|pi 仅启动一个\n全部启动端口: --claude-port 7331 --pi-port 7332\n单入口端口: --harness claude-code|pi --port PORT\n公共选项: --home DIR --node PATH --root DIR\n环境文件: <home>/env，每行 KEY=VALUE，前台和后台服务启动都会读取\n首次连接: Codex 设置 → 连接 → SSH → 添加；可选将输出的配置加入 ~/.ssh/config；Ctrl-C 停止全部入口")
+		fmt.Println("用法: codex-harness-adapter start|init|serve|ssh-config|doctor [选项]\nstart: 自动初始化并启动可用的 Claude Code 和 Pi；可用 --harness claude-code|pi 仅启动一个\n全部启动端口: --claude-port 7331 --pi-port 7332 --dsh-port 7333\n单入口端口: --harness claude-code|pi|dsh --port PORT\n实验入口 dsh（DeepSeek Harness）: 检测到本机装有 dsh 时随全部启动，没装时不提示\n公共选项: --home DIR --node PATH --root DIR\n环境文件: <home>/env，每行 KEY=VALUE，前台和后台服务启动都会读取\n首次连接: Codex 设置 → 连接 → SSH → 添加；可选将输出的配置加入 ~/.ssh/config；Ctrl-C 停止全部入口")
 		return nil
 	}
 	if args[0] == "entry" {
@@ -85,9 +86,8 @@ func run(ctx context.Context, args []string) error {
 			return doctor(ctx, cfg)
 		}
 		var failures []error
-		for _, harness := range []string{"claude-code", "pi"} {
-			cfg.harness = harness
-			failures = append(failures, doctor(ctx, cfg))
+		for _, entry := range cfg.entries() {
+			failures = append(failures, doctor(ctx, entry))
 		}
 		return errors.Join(failures...)
 	}
@@ -109,21 +109,22 @@ func parseConfiguration(args []string) (configuration, error) {
 	}
 	flags := flag.NewFlagSet("codex-harness-adapter", flag.ContinueOnError)
 	cfg := configuration{}
-	flags.StringVar(&cfg.harness, "harness", "", "claude-code 或 pi")
+	flags.StringVar(&cfg.harness, "harness", "", "claude-code、pi 或实验性的 dsh")
 	flags.StringVar(&cfg.home, "home", filepath.Join(home, ".codex-harness-adapter"), "适配器状态根目录")
 	flags.StringVar(&cfg.root, "root", filepath.Dir(filepath.Dir(executable)), "适配器源码根目录")
 	flags.StringVar(&cfg.node, "node", "node", "Node 可执行文件")
 	flags.IntVar(&cfg.port, "port", 0, "回环 SSH 端口")
 	flags.IntVar(&cfg.claudePort, "claude-port", 7331, "全部启动时 Claude SSH 端口")
 	flags.IntVar(&cfg.piPort, "pi-port", 7332, "全部启动时 Pi SSH 端口")
+	flags.IntVar(&cfg.dshPort, "dsh-port", 7333, "全部启动时 dsh SSH 端口")
 	if err := flags.Parse(args); err != nil {
 		return cfg, err
 	}
 	if flags.NArg() != 0 {
 		return cfg, errors.New("不接受位置参数")
 	}
-	if cfg.harness != "" && cfg.harness != "claude-code" && cfg.harness != "pi" {
-		return cfg, errors.New("harness 必须为 claude-code 或 pi")
+	if cfg.harness != "" && cfg.harness != "claude-code" && cfg.harness != "pi" && cfg.harness != "dsh" {
+		return cfg, errors.New("harness 必须为 claude-code、pi 或 dsh")
 	}
 	if cfg.harness == "" && cfg.port != 0 {
 		return cfg, errors.New("--port 需要指定 --harness；全部启动请用 --claude-port 和 --pi-port")
@@ -131,10 +132,16 @@ func parseConfiguration(args []string) (configuration, error) {
 	if cfg.claudePort < 1 || cfg.claudePort > 65535 || cfg.piPort < 1 || cfg.piPort > 65535 || cfg.claudePort == cfg.piPort {
 		return cfg, errors.New("Claude 和 Pi 端口必须不同，且在 1 到 65535 之间")
 	}
+	if cfg.dshPort < 1 || cfg.dshPort > 65535 || cfg.dshPort == cfg.claudePort || cfg.dshPort == cfg.piPort {
+		return cfg, errors.New("dsh 端口必须与 Claude 和 Pi 的端口不同，且在 1 到 65535 之间")
+	}
 	if cfg.port == 0 {
 		cfg.port = cfg.claudePort
 		if cfg.harness == "pi" {
 			cfg.port = cfg.piPort
+		}
+		if cfg.harness == "dsh" {
+			cfg.port = cfg.dshPort
 		}
 	}
 	if cfg.port < 1 || cfg.port > 65535 {
@@ -151,22 +158,58 @@ func parseConfiguration(args []string) (configuration, error) {
 	return cfg, err
 }
 
+// dsh 入口还在实验阶段，默认启动时是特例：只有检测到本机装有 dsh 才带上它，没装时不告警也不占端口，
+// Claude 和 Pi 不受影响。装了但版本过低或启动失败时，与另外两个入口一样只告警。
 func (c configuration) entries() []configuration {
 	if c.harness != "" {
 		return []configuration{c}
 	}
-	claude, pi := c, c
+	claude, pi, dsh := c, c, c
 	claude.harness, claude.port = "claude-code", c.claudePort
 	pi.harness, pi.port = "pi", c.piPort
+	dsh.harness, dsh.port = "dsh", c.dshPort
+	if dshInstalled(dsh) {
+		return []configuration{claude, pi, dsh}
+	}
 	return []configuration{claude, pi}
+}
+
+// 与适配器定位 dsh 的规则一致：设置了 CHA_DSH_CLI 就认为用户要用 dsh（路径无效会在启动时告警），
+// 否则在 PATH 里找可执行的 dsh。版本是否达到下限由适配器启动前的环境检查判断。
+var dshInstalled = func(c configuration) bool {
+	env := map[string]string{}
+	for _, entry := range c.environment() {
+		name, value, _ := strings.Cut(entry, "=")
+		env[name] = value
+	}
+	if strings.TrimSpace(env["CHA_DSH_CLI"]) != "" {
+		return true
+	}
+	names := []string{"dsh"}
+	if runtime.GOOS == "windows" {
+		names = []string{"dsh.exe", "dsh.cmd", "dsh"}
+	}
+	search := env["PATH"]
+	if search == "" {
+		search = env["Path"]
+	}
+	for _, directory := range filepath.SplitList(search) {
+		for _, name := range names {
+			info, err := os.Stat(filepath.Join(directory, name))
+			if err == nil && !info.IsDir() && (runtime.GOOS == "windows" || info.Mode()&0o111 != 0) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (c configuration) directory() string { return filepath.Join(c.home, c.harness) }
 func (c configuration) socket() string    { return hostplatform.SocketPath(c.directory()) }
 func (c configuration) adapter() string {
 	name := "claude"
-	if c.harness == "pi" {
-		name = "pi"
+	if c.harness == "pi" || c.harness == "dsh" {
+		name = c.harness
 	}
 	return filepath.Join(c.root, "packages", name, "dist", name, "src", "adapter.mjs")
 }
@@ -174,7 +217,7 @@ func (c configuration) adapter() string {
 func (c configuration) environment() []string {
 	values := map[string]string{
 		"CODEX_HOME":      filepath.Join(c.directory(), "codex"),
-		"CHA_CLAUDE_HOME": c.directory(), "CHA_PI_HOME": c.directory(),
+		"CHA_CLAUDE_HOME": c.directory(), "CHA_PI_HOME": c.directory(), "CHA_DSH_HOME": c.directory(),
 		"CHA_CLAUDE_IDLE_EXIT_MS": "0",
 	}
 	result := []string{}

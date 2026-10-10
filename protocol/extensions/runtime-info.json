@@ -18,7 +18,8 @@
       "engine": {
         "enum": [
           "claude-code",
-          "pi"
+          "pi",
+          "dsh"
         ]
       },
       "protocolVersion": {
@@ -101,6 +102,20 @@
           "nodeVersion",
           "sdkVersion",
           "pluginVersions"
+        ]
+      },
+      {
+        "properties": {
+          "engine": {
+            "const": "dsh"
+          },
+          "cliBuild": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+\\.\\d+(-[0-9A-Za-z.-]+)?$"
+          }
+        },
+        "required": [
+          "nodeVersion"
         ]
       }
     ],

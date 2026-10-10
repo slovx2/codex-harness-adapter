@@ -5,6 +5,27 @@ The project is still private in `package.json`; this file tracks release notes
 for maintainers preparing the next public release and does not change package
 versioning or publishing metadata.
 
+## 未发布
+
+- Pi 入口不再自带 Pi 本体，改为加载用户安装的 Pi（`PATH` 中的 `pi` 或 `PI_CLI`），只要求版本不低于 0.99.1；
+  升级 Pi 后重启适配器即可生效。Pi 需用 npm 安装，独立二进制不含可加载的运行时。
+- 计划模式、子代理和界面组件插件继续随适配器分发；Homebrew 安装中 Pi 部分的依赖从约 295 MB 降到约 14 MB。
+- 找不到 Pi、Pi 不是 npm 安装、版本过低或接口与适配器不兼容时，`doctor` 和启动检测给出对应的处理提示，其他入口不受影响。
+- 新增实验性的 DeepSeek Harness 入口（`--harness dsh`，默认端口 7333）：使用用户安装的 `dsh`（`PATH` 或 `CHA_DSH_CLI`，
+  不低于 0.2.0-rc.2），支持线程列表、发消息、逐字流式输出、提权审批、中断和历史回放；密钥只读取 `DEEPSEEK_API_KEY`，
+  会话日志上传默认关闭。本机装有 dsh 时随默认启动一并带起，没装时不提示；其余能力与限制见配置文档。
+- Claude 子代理在后台运行时，主回合等到子代理真正结束再收尾，子代理的结果不再丢失；等待期间主回合的输出照常显示。
+- Claude 子代理的正文、思考和工具调用显示在它自己的子线程里；结果不再带 CLI 的内部说明文字。
+- 可以在已结束的 Claude 子代理子线程里继续追问：消息经主会话原样转给该子代理，子代理带着此前的上下文作答。
+  主任务运行中、工作流子代理不支持；追问进行中主线程不能开始新回合。
+- 恢复 Claude 的任务清单：固定让 CLI 使用 TodoWrite，`turn/plan/updated` 在新模型下重新出现。
+- Claude 入口的 MCP 状态：一个服务启动失败不再让排在它后面的服务没有状态；声明了资源能力但没有实现资源模板目录的服务
+  不再被判为失败（此前会让整个 MCP 状态列表报错）。
+- 删除从未生效的 `CHA_CLAUDE_ENABLE_FILE_CHECKPOINTING`。
+- Claude 包的 Node 要求与其余部分一致，放宽为 24（>= 24.0.0）；此前子包仍写着 24.14.0，低于它的 24.x 安装依赖时会有引擎版本警告。
+- Pi 入口 `model/list` 的默认推理强度改为该模型实际生效的值；此前对不支持 medium 的模型也报 medium，
+  例如 DeepSeek 模型实际按 high 运行。
+
 ## 0.4.4
 
 - `thread/resume` 与回退响应返回真实的 `turnsBackwardsCursor` / `itemsBackwardsCursor` 头部游标（Claude 与 Pi）。

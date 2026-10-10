@@ -6,13 +6,13 @@
 
 **用成熟的 Codex 桌面 UI 控制 Claude Code、Pi 等 harness。** 在一个界面里管理项目、对话、文件修改和审批，继续使用各引擎自己的模型配置与登录。
 
-目前支持 Claude Code、Pi，适用于 macOS、Linux、Windows。
+目前支持 Claude Code、Pi，适用于 macOS、Linux、Windows；DeepSeek Harness 为实验性支持（[说明](docs/guide/configuration.md#deepseek-harness实验性)）。
 
 ## 安装与启动
 
 ### macOS：Homebrew（后台运行）
 
-先安装并登录 Claude Code 或 Pi（至少一个）。Claude 需要本机独立安装的 `claude` 已登录（`claude auth status` 显示已登录），然后：
+先安装并登录 Claude Code 或 Pi（至少一个）。Claude 需要本机独立安装的 `claude` 已登录（`claude auth status` 显示已登录）；Pi 需用 npm 安装（`npm install -g @earendil-works/pi-coding-agent`），适配器直接使用这份安装。然后：
 
 ```sh
 brew install slovx2/tap/codex-harness-adapter
@@ -24,7 +24,7 @@ codex-harness-adapter ssh-config
 
 ### 从源码启动
 
-准备 Node.js **24**、Go **≥ 1.26.6**，以及至少一个已配置登录的引擎：[Claude Code **≥ 2.1.282**](https://code.claude.com/docs/en/setup) 或 [Pi **≥ 0.99.1**](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/README.md#getting-started)。接受更高稳定版本，无需安装精确版本。[各系统依赖](docs/guide/getting-started.md#系统依赖)
+准备 Node.js **24**、Go **≥ 1.26.6**，以及至少一个已配置登录的引擎：[Claude Code **≥ 2.1.282**](https://code.claude.com/docs/en/setup) 或 [Pi **≥ 0.99.1**](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/README.md#getting-started)（npm 安装）。接受更高稳定版本，无需安装精确版本。[各系统依赖](docs/guide/getting-started.md#系统依赖)
 
 ```sh
 git clone https://github.com/slovx2/codex-harness-adapter.git

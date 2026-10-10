@@ -6,13 +6,13 @@
 
 **Control Claude Code, Pi, and other harnesses through the mature Codex desktop UI.** Manage projects, conversations, file changes, and approvals in one place while keeping each harness's own models and login.
 
-Currently supports Claude Code and Pi on macOS, Linux, and Windows.
+Currently supports Claude Code and Pi on macOS, Linux, and Windows; DeepSeek Harness support is experimental ([details](docs/guide/configuration.md#deepseek-harness实验性)).
 
 ## Install and run
 
 ### macOS: Homebrew (background service)
 
-Install and sign in to Claude Code or Pi (at least one). Claude needs the standalone `claude` CLI signed in (`claude auth status` reports logged in). Then:
+Install and sign in to Claude Code or Pi (at least one). Claude needs the standalone `claude` CLI signed in (`claude auth status` reports logged in); Pi must be installed with npm (`npm install -g @earendil-works/pi-coding-agent`), and the adapter uses that install directly. Then:
 
 ```sh
 brew install slovx2/tap/codex-harness-adapter
@@ -24,7 +24,7 @@ The service starts at login and restarts if it exits unexpectedly. It uses Homeb
 
 ### Run from source
 
-Install Node.js **24**, Go **≥ 1.26.6**, and at least one configured harness: [Claude Code **≥ 2.1.282**](https://code.claude.com/docs/en/setup) or [Pi **≥ 0.99.1**](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/README.md#getting-started). Newer stable versions are accepted; exact versions are not required. [Platform dependencies](docs/guide/getting-started.md#系统依赖)
+Install Node.js **24**, Go **≥ 1.26.6**, and at least one configured harness: [Claude Code **≥ 2.1.282**](https://code.claude.com/docs/en/setup) or [Pi **≥ 0.99.1**](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/README.md#getting-started) (installed with npm). Newer stable versions are accepted; exact versions are not required. [Platform dependencies](docs/guide/getting-started.md#系统依赖)
 
 ```sh
 git clone https://github.com/slovx2/codex-harness-adapter.git

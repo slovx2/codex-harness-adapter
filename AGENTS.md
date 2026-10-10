@@ -3,14 +3,16 @@
 本项目将 Claude Code、Pi 等 harness 接入 Codex app-server 协议。
 
 - 用中文写新增注释与维护文档。在当前分支工作，不创建 worktree。
-- `packages/claude`、`packages/pi` 是并列适配器；`packages/shared` 只承载共享能力。
+- `packages/claude`、`packages/pi`、`packages/dsh`（DeepSeek Harness，实验性）是并列适配器；`packages/shared` 只承载共享能力。
 - `sshserver` 是通用 Go 库，不允许依赖 Tyrs Hand。`cmd/codex-harness-adapter` 是仅监听本机的 CLI。
 - TypeScript 使用 `.mts`、ESM、可擦除语法；不手工修改 `dist` 或生成的协议材料。
 - 仓库的依赖声明与锁文件必须使用精确版本，CI 的可复现验证基线见 `protocol/versions.json`；不要因此要求用户把本机工具降级或安装精确版本。
-- 用户环境采用最低稳定版要求：Node.js 24（>= 24.0.0）、Go >= 1.26.6（仅源码构建）、Claude Code CLI >= 2.1.282、Pi CLI >= 0.99.1。版本检测接受基线及更高稳定版，拒绝低版本、预发布及非法格式；`engines` 是环境范围，不是依赖锁。
+- harness 本体（Claude Code、Pi、DeepSeek Harness 等的 CLI 与运行时）不打包进适配器：不作为依赖随仓库、构建产物或 Homebrew 配方分发，一律使用用户自己安装的 harness。适配器为接入某个 harness 而必须携带的插件包（如 Pi 的计划模式、子代理、界面组件插件）不属于本体，随适配器分发并使用精确版本。
+- 对用户安装的 harness 只设版本下限（高于或等于某个版本即可），不写死版本，不做完全相等校验。
+- 用户环境采用最低稳定版要求：Node.js 24（>= 24.0.0）、Go >= 1.26.6（仅源码构建）、Claude Code CLI >= 2.1.282、Pi CLI >= 0.99.1、DeepSeek Harness >= 0.2.0-rc.2。版本检测接受基线及更高稳定版，拒绝低版本、预发布及非法格式（DeepSeek Harness 尚无稳定版，其入口按预发布号比较）；`engines` 是环境范围，不是依赖锁。
 - README 中区分用户环境下限、仓库自动安装的 SDK/插件版本和 Codex 协议版本。不得把 CI 精确版本写成用户必须安装的版本。
 - 中英文 README 只保留四部分：解决什么问题、安装与启动（Homebrew 与源码）、Codex 桌面配置、工作原理/高级使用/排障；保持简短，开发细节与平台限制放到链接文档。
-- 默认用户入口是 `npm start`（macOS 另有 Homebrew `brew services` 后台服务，读取同一状态目录与 `env` 文件）：自动检测 Claude/Pi 的 CLI 和运行环境，初始化并启动可用入口，逐项输出状态；缺失或失败只告警，不影响其他入口。支持 `--harness` 单独选择，没有入口可用才整体失败；中断时清理本次启动的全部进程。
+- 默认用户入口是 `npm start`（macOS 另有 Homebrew `brew services` 后台服务，读取同一状态目录与 `env` 文件）：自动检测 Claude/Pi 的 CLI 和运行环境，初始化并启动可用入口，逐项输出状态；缺失或失败只告警，不影响其他入口；实验性的 dsh 入口只在检测到用户装了 dsh 时才启动，没装时不告警。支持 `--harness` 单独选择，没有入口可用才整体失败；中断时清理本次启动的全部进程。
 - 用户终端输出只保留状态、连接参数和可操作的错误提示。原始诊断 JSON、内部发布标记、SDK/Node 警告、堆栈及子进程输出写入私有诊断或运行日志；不要让用户通过阅读内部字段判断是否成功，也不要用全局关闭警告掩盖排障证据。
 - 旧适配数据库直接拒绝，不增加旧环境变量、持久化标记或路径回退。
 - 修改应分小块进行，每次尽量不超过 300 行。
@@ -23,6 +25,7 @@ CI 使用 Node 24 最新补丁版、Go 1.26.6 复现基线；本地可使用满�
 npm ci
 npm ci --prefix packages/claude
 npm ci --prefix packages/pi
+npm ci --prefix packages/dsh
 npm run build
 npm run check:fix
 npm run typecheck

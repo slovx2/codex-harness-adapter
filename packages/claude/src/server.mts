@@ -42,8 +42,10 @@ import {
   permissionToolName,
 } from './permission-grants.mjs'
 import {
+  historyHeadCursors,
   ProtocolError,
   pageRecords,
+  pageThreadItems,
   rejectForeignModel,
   requiredString,
   submissionHash,
@@ -1385,16 +1387,10 @@ export class CodexClaudeAppServer {
   private threadItemsList(params: Record<string, unknown>): unknown {
     const threadId = requiredString(params.threadId, 'threadId')
     if (!this.store.getThread(threadId)) throw new ProtocolError(-32602, '未知会话')
-    const items = this.store
-      .listTurns(threadId)
-      .filter((turn) => params.turnId == null || turn.id === params.turnId)
-      .flatMap((turn) => turn.items.map((item) => ({ turnId: turn.id, item })))
-    return pageRecords(
-      items,
-      { ...params, sortDirection: params.sortDirection ?? 'asc' },
-      `items:${threadId}:${params.turnId ?? ''}`,
-      (entry) => `${entry.turnId}:${entry.item.id}`,
-    )
+    return pageThreadItems(threadId, this.store.listTurns(threadId), {
+      ...params,
+      sortDirection: params.sortDirection ?? 'asc',
+    })
   }
 
   private saveRuntimeSettings(threadId: string, params: Record<string, unknown>): void {
@@ -1953,21 +1949,6 @@ export class CodexClaudeAppServer {
     // 两种 historyMode 共用同一持久化历史；保留原模式，不阻断旧会话使用新入口。
     // 原生分叉与 SQLite 提交共用旧入口的事务，文件系统副作用不回退。
     await this.threadRollback({ threadId, numTurns: turns.length - index })
-    const retained = this.store.listTurns(threadId)
-    const items = retained.flatMap((turn) => turn.items.map((item) => ({ turnId: turn.id, item })))
-    const pageParams = { limit: 1, sortDirection: 'desc' }
-    const turnsBackwardsCursor = pageRecords(
-      retained,
-      pageParams,
-      `turns:${threadId}`,
-      (turn) => turn.id,
-    ).backwardsCursor
-    const itemsBackwardsCursor = pageRecords(
-      items,
-      pageParams,
-      `items:${threadId}:`,
-      (entry) => `${entry.turnId}:${entry.item.id}`,
-    ).backwardsCursor
     const thread = this.store.getThread(threadId)!
     setImmediate(() =>
       this.notifyThread(threadId, {
@@ -1975,7 +1956,10 @@ export class CodexClaudeAppServer {
         params: { threadId },
       }),
     )
-    return { thread: this.toThread(thread, []), turnsBackwardsCursor, itemsBackwardsCursor }
+    return {
+      thread: this.toThread(thread, []),
+      ...historyHeadCursors(threadId, this.store.listTurns(threadId)),
+    }
   }
 
   private threadShellCommand(peer: RpcPeer, params: Record<string, unknown>): unknown {
@@ -5258,8 +5242,7 @@ export class CodexClaudeAppServer {
       reasoningEffort: thread.reasoningEffort,
       multiAgentMode: 'explicitRequestOnly',
       initialTurnsPage: null,
-      turnsBackwardsCursor: null,
-      itemsBackwardsCursor: null,
+      ...historyHeadCursors(thread.id, this.store.listTurns(thread.id)),
     }
   }
 

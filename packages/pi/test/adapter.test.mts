@@ -490,6 +490,51 @@ createInterface({input:process.stdin}).on('line',line=>{
       input: [{ type: 'text', text: 'where' }],
     })
     await completed(otherTurn.turn.id, 'mobile')
+    // 桌面对 paginated 线程要求 thread/resume 带两个头部游标，再用它们向后拉回合与条目。
+    replies.push({ text: 'second reply' })
+    const otherTurn2 = await ok('mobile', 'turn/start', {
+      threadId: other.thread.id,
+      input: [{ type: 'text', text: 'again' }],
+    })
+    await completed(otherTurn2.turn.id, 'mobile')
+    const paged = await ok('mobile', 'thread/resume', { threadId: other.thread.id })
+    assert.equal(typeof paged.turnsBackwardsCursor, 'string')
+    assert.equal(typeof paged.itemsBackwardsCursor, 'string')
+    const pagedTurns = await ok('mobile', 'thread/turns/list', {
+      threadId: other.thread.id,
+      cursor: paged.turnsBackwardsCursor,
+      limit: 5,
+      itemsView: 'notLoaded',
+      sortDirection: 'desc',
+    })
+    assert.deepEqual(
+      pagedTurns.data.map((t: any) => t.id),
+      [otherTurn2.turn.id, otherTurn.turn.id],
+      '头部游标包含最新回合',
+    )
+    // 桌面对每个回合都用同一个线程级条目游标取该回合的条目。
+    for (const turn of paged.thread.turns) {
+      const collected: any[] = []
+      let cursor: string | null = paged.itemsBackwardsCursor
+      for (let page = 0; page < 10; page++) {
+        const items = await ok('mobile', 'thread/items/list', {
+          threadId: other.thread.id,
+          turnId: turn.id,
+          cursor,
+          limit: 1,
+          sortDirection: 'desc',
+        })
+        assert.ok(items.data.every((entry: any) => entry.turnId === turn.id))
+        collected.push(...items.data.map((entry: any) => entry.item.id))
+        cursor = items.nextCursor
+        if (cursor == null) break
+      }
+      assert.equal(cursor, null, '条目分页必须收敛')
+      assert.deepEqual(
+        collected.reverse(),
+        turn.items.map((item: any) => item.id),
+      )
+    }
     assert.equal(server.sessions.get(other.thread.id)!.session.sessionManager.getCwd(), cwd2)
     assert.equal(server.sessions.get(threadId)!.session.sessionManager.getCwd(), cwd)
     await ok('mobile', 'thread/unsubscribe', { threadId: other.thread.id })

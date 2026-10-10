@@ -10,7 +10,13 @@ import {
 } from '@earendil-works/pi-coding-agent'
 import { gitDiffToRemote } from '../../shared/src/git-diff-remote.mjs'
 import { projectRequest } from '../../shared/src/project-rpc.mjs'
-import { ProtocolError, pageRecords, requiredString } from '../../shared/src/protocol-contract.mjs'
+import {
+  historyHeadCursors,
+  ProtocolError,
+  pageRecords,
+  pageThreadItems,
+  requiredString,
+} from '../../shared/src/protocol-contract.mjs'
 import { codexUserAgent, platformFamily, platformOs } from '../../shared/src/runtime-version.mjs'
 import { PINNED_SECTION_ID } from '../../shared/src/thread-sections.mjs'
 import type { RpcPeer } from '../../shared/src/types.mjs'
@@ -292,7 +298,7 @@ export async function dispatch(s: PiServer, peer: RpcPeer, method: string, p: an
       if (method === 'thread/resume' && !s.active.has(thread.id)) await s.load(thread, peer, true)
       if (method === 'thread/resume') restoreUsage(s, peer, thread.id)
       return method === 'thread/resume'
-        ? s.settings(thread)
+        ? { ...s.settings(thread), ...historyHeadCursors(thread.id, s.store.turns(thread.id)) }
         : { thread: s.envelope(thread, p.includeTurns !== false) }
     }
     case 'thread/unsubscribe': {
@@ -370,18 +376,8 @@ export async function dispatch(s: PiServer, peer: RpcPeer, method: string, p: an
     case 'thread/turns/list':
       return pageRecords(s.store.turns(p.threadId), p, `turns:${p.threadId}`, (t) => t.id)
     case 'thread/turns/items/list':
-    case 'thread/items/list': {
-      const items = s.store
-        .turns(p.threadId)
-        .filter((t) => !p.turnId || t.id === p.turnId)
-        .flatMap((t) => t.items.map((item) => ({ turnId: t.id, item })))
-      return pageRecords(
-        items,
-        p,
-        `items:${p.threadId}:${p.turnId ?? ''}`,
-        (i) => `${i.turnId}:${i.item.id}`,
-      )
-    }
+    case 'thread/items/list':
+      return pageThreadItems(p.threadId, s.store.turns(p.threadId), p)
     case 'thread/timeline/list': {
       const rows = s.store.turns(p.threadId).flatMap((t) => [
         { key: `${t.id}:start`, type: 'turnStarted', turnId: t.id, startedAt: t.startedAt },
@@ -572,5 +568,5 @@ async function nativeMutation(s: PiServer, peer: RpcPeer, method: string, p: any
   session.sessionManager.appendCustomEntry('codex-harness-adapter-branch', { operation: method })
   s.store.replaceTurns(thread.id, projectHistory(session.sessionManager.getBranch(), thread))
   s.notify(thread.id, 'thread/reverted', {})
-  return { thread: s.envelope(thread), turnsBackwardsCursor: null, itemsBackwardsCursor: null }
+  return { thread: s.envelope(thread), ...historyHeadCursors(thread.id, s.store.turns(thread.id)) }
 }

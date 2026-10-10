@@ -5,6 +5,13 @@ The project is still private in `package.json`; this file tracks release notes
 for maintainers preparing the next public release and does not change package
 versioning or publishing metadata.
 
+## 0.4.4
+
+- `thread/resume` 与回退响应返回真实的 `turnsBackwardsCursor` / `itemsBackwardsCursor` 头部游标（Claude 与 Pi）。
+  桌面对 `historyMode: paginated` 的线程要求这两个字段，Pi 此前不返回，恢复对话报
+  `itemsBackwardsCursor` / `turnsBackwardsCursor` 缺失；Claude 此前返回 null，桌面会把历史当作空。
+- `thread/items/list` 的游标改为线程级：桌面用同一个头部游标逐回合带 `turnId` 取条目，此前会被判为无效游标。
+
 ## 0.4.3
 
 - Pi 被打断或失败的模型请求不再上报全零用量，桌面的上下文占用不会被清零；

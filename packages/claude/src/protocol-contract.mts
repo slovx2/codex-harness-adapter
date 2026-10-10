@@ -3,8 +3,10 @@ import { isApprovalPolicy } from './approval-policy.mjs'
 import { parseSandboxPolicy, type RuntimeSandboxPolicy } from './sandbox-policy.mjs'
 
 export {
+  historyHeadCursors,
   ProtocolError,
   pageRecords,
+  pageThreadItems,
   requiredString,
   submissionHash,
 } from '../../shared/src/protocol-contract.mjs'

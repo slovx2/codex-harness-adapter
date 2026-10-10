@@ -7,7 +7,7 @@ import { MockLLM } from './fixtures/mock-llm.mjs'
 import { ProtocolClient } from './fixtures/protocol-client.mjs'
 
 async function pages(client: ProtocolClient, method: string, params: Record<string, unknown>) {
-  let cursor: string | null = null
+  let cursor = (params.cursor as string | undefined) ?? null
   const data: any[] = []
   for (let page = 0; page < 30; page++) {
     const result = await client.request(method, { ...params, cursor, limit: 2 })
@@ -167,6 +167,29 @@ test('HISTORY-002：真实工具大输出、全量与摘要视图、双向分页
         resumed.initialTurnsPage.data.map((turn: any) => turn.id),
         [...turns].reverse().slice(0, 2),
       )
+      // 桌面对 paginated 线程用恢复响应里的头部游标向后拉回合，再逐回合用同一个条目游标取条目。
+      const headTurns = await client.request('thread/turns/list', {
+        threadId,
+        cursor: resumed.turnsBackwardsCursor,
+        limit: 5,
+        itemsView: 'notLoaded',
+        sortDirection: 'desc',
+      })
+      assert.deepEqual(
+        headTurns.data.map((turn: any) => turn.id),
+        [...turns].reverse(),
+      )
+      for (const turnId of turns) {
+        assert.deepEqual(
+          await pages(client, 'thread/items/list', {
+            threadId,
+            turnId,
+            sortDirection: 'desc',
+            cursor: resumed.itemsBackwardsCursor,
+          }),
+          expected.filter((entry: any) => entry.turnId === turnId).reverse(),
+        )
+      }
     }
     assert.equal(model.requests.length, callsBeforeRead, '恢复和所有历史视图不能发起模型请求')
     model.assertConsumed()

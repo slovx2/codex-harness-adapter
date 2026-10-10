@@ -31,11 +31,13 @@ export function submissionHash(value: unknown): string {
     .digest('hex')
 }
 
+// include 在游标定位之后过滤：游标属于整个序列，过滤条件不影响它的有效性。
 export function pageRecords<T>(
   records: T[],
   params: Record<string, unknown>,
   scope: string,
   identity: (record: T) => string,
+  include: (record: T) => boolean = () => true,
 ) {
   const limit = params.limit ?? 50
   if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1 || limit > 1000)
@@ -57,13 +59,40 @@ export function pageRecords<T>(
       throw new ProtocolError(-32602, '历史游标无效或已失效')
     }
   }
-  const data = ordered.slice(offset, offset + limit)
+  const remaining = ordered.slice(offset).filter(include)
+  const data = remaining.slice(0, limit)
   const cursorFor = (record: T, inclusive = false) =>
     Buffer.from(JSON.stringify({ scope, id: identity(record), inclusive })).toString('base64url')
   return {
     data,
-    nextCursor:
-      offset + limit < ordered.length && data.length ? cursorFor(data[data.length - 1]!) : null,
+    nextCursor: limit < remaining.length && data.length ? cursorFor(data[data.length - 1]!) : null,
     backwardsCursor: data.length ? cursorFor(data[0]!, true) : null,
+  }
+}
+
+type HistoryTurn<I extends { id: string } = { id: string }> = { id: string; items: I[] }
+
+// 条目游标是线程级的：桌面拿 thread/resume 给的同一个头部游标，逐个回合带 turnId 取条目。
+export function pageThreadItems<I extends { id: string }>(
+  threadId: string,
+  turns: HistoryTurn<I>[],
+  params: Record<string, unknown>,
+) {
+  return pageRecords(
+    turns.flatMap((turn) => turn.items.map((item) => ({ turnId: turn.id, item }))),
+    params,
+    `items:${threadId}`,
+    (entry) => `${entry.turnId}:${entry.item.id}`,
+    (entry) => !params.turnId || entry.turnId === params.turnId,
+  )
+}
+
+// thread/resume 与 thread/revert 返回的头部游标：包含最新回合与最新条目，历史为空时为 null。
+export function historyHeadCursors(threadId: string, turns: HistoryTurn[]) {
+  const head = { limit: 1, sortDirection: 'desc' }
+  return {
+    turnsBackwardsCursor: pageRecords(turns, head, `turns:${threadId}`, (turn) => turn.id)
+      .backwardsCursor,
+    itemsBackwardsCursor: pageThreadItems(threadId, turns, head).backwardsCursor,
   }
 }

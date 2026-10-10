@@ -693,6 +693,64 @@ export function wrapMcpToolError(content: unknown): { message: string } {
   return { message: JSON.stringify(content) }
 }
 
+// Agent 工具的结构化结果（SDK 的 tool_use_result）：正文不带模型侧的包装前缀与尾部，
+// 用量来自运行统计。只认已完成的形态，后台启动回执不是结果。
+export function subagentStructuredResult(value: unknown): SubagentTrailer | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const result = value as Record<string, unknown>
+  if (result.status !== 'completed' || !Array.isArray(result.content)) return null
+  const cleanText = result.content
+    .map((block) =>
+      block && typeof block === 'object' && (block as Record<string, unknown>).type === 'text'
+        ? String((block as Record<string, unknown>).text ?? '')
+        : '',
+    )
+    .filter(Boolean)
+    .join('\n')
+  const totalTokens = Number(result.totalTokens)
+  return {
+    cleanText,
+    agentId: typeof result.agentId === 'string' && result.agentId ? result.agentId : null,
+    usage: Number.isFinite(totalTokens)
+      ? {
+          totalTokens,
+          toolUses: Number(result.totalToolUseCount) || 0,
+          durationMs: Number(result.totalDurationMs) || 0,
+        }
+      : null,
+  }
+}
+
+// 工具结果写回对应条目：命令、文件修改、MCP 调用与搜索各自的终态字段不同。
+export function toolItemWithResult(
+  item: ThreadItem,
+  content: unknown,
+  isError: boolean,
+  durationMs: number | null,
+): ThreadItem {
+  if (item.type === 'commandExecution')
+    return {
+      ...item,
+      status: isError ? 'failed' : 'completed',
+      aggregatedOutput: item.aggregatedOutput ?? toolResultText(content),
+      exitCode: parseExitCodeFromResult(content) ?? (isError ? 1 : 0),
+      durationMs,
+    }
+  if (item.type === 'fileChange') return { ...item, status: isError ? 'failed' : 'completed' }
+  if (item.type === 'mcpToolCall')
+    // 协议要求 McpToolCallResult = {content[], structuredContent, _meta}，错误为 {message}。
+    return {
+      ...item,
+      status: isError ? 'failed' : 'completed',
+      result: isError ? null : wrapMcpToolResult(content),
+      error: isError ? wrapMcpToolError(content) : null,
+      durationMs,
+    }
+  if (item.type === 'webSearch')
+    return { ...item, action: parseWebSearchAction(item.query, toolResultText(content)) }
+  return item
+}
+
 export function parseSubagentTrailer(text: string): SubagentTrailer {
   if (!text) return { cleanText: '', agentId: null, usage: null }
   let cleanText = text

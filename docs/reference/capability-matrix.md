@@ -45,7 +45,9 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | File edit approval | Supported | Edit/Write/MultiEdit → Codex fileChange items with approval + diff updates. |
 | Bash output | Supported | Forwarded as command output on completion (SDK has no incremental tool-output streaming). |
 | Generic Claude tools | Supported | Non-command/file tools → mcpToolCall items under the `claude-code` pseudo server. |
-| Subagent (Task) | Supported | Task spawns an ephemeral child thread and emits native `subAgentActivity` lifecycle events (capability-gated `completed`) plus `spawnAgent`/`wait` tool state; inner events are hidden, and the final result lands as one agentMessage on the child thread. |
+| Subagent (Task) | Supported | Task spawns an ephemeral child thread and emits native `subAgentActivity` lifecycle events (capability-gated `completed`) plus `spawnAgent`/`wait` tool state. 子代理的正文、思考与工具调用投影为子线程自己的条目，最后一段正文即结果（不再另写一条）；结果取 SDK 的结构化工具结果，不含 CLI 的内部包装文字。 |
+| 后台子代理 | Supported | CLI 默认把子代理放到后台：启动回执不当作结果，主回合照常继续；回合在 CLI 上报会话空闲后才结束，子代理的真实结果在此之前送达父线程与子线程。后台 Bash 不在等待范围内，仍随每回合的 CLI 进程结束。 |
+| 子线程追问 | Supported (中转) | 在已结束的子代理子线程里发消息：适配器恢复父会话，由主模型调用 `SendMessage` 把用户原文转给该子代理（钩子写定收件人与正文，并拒绝其他工具），子代理带着此前的上下文继续，输出显示在子线程，父线程不新增回合。每次追问占用父会话一个隐藏回合；父回合进行中、Workflow 子代理或没有可恢复记录时拒绝（`-32009`），追问进行中父线程不能开新回合，追问回合内的追加输入（`turn/steer`）同样拒绝。被恢复的子代理再派出的子代理不单独显示。 |
 | Ephemeral / threadSource | Supported | `ephemeral: true` threads (title-gen, memory-consolidation, subagents) persist but are excluded from `thread/list` unless `includeEphemeral: true`. `threadSource` round-trips. |
 | Claude side events | Supported | rate_limit / hook / subagent / compaction events summarized into structured notice lines. |
 | Review mode | Supported (text) | `review/start` creates an in-progress review turn and routes the prompt through Claude. No native guardian finding items. |
@@ -55,7 +57,7 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| MCP config/status/tools | Supported | Reads Claude MCP config, passes servers into turns, calls stdio/HTTP tools directly. `mcpServerStatus/list` enumerates real `tools`/`resources`/`resourceTemplates` per server (10s cache, graceful empty fallback on spawn/timeout). |
+| MCP config/status/tools | Supported | Reads Claude MCP config, passes servers into turns, calls stdio/HTTP tools directly. `mcpServerStatus/list` enumerates real `tools`/`resources`/`resourceTemplates` per server. 服务启动或枚举失败时整个查询返回 `-32001`，不返回空成功；声明了资源能力但没有实现 `resources/templates/list` 的服务按没有模板处理。连接后的启动探测逐个进行，一个服务失败不影响其余服务的状态通知。 |
 | Turn-item paging | Supported | `thread/turns/list` honors `itemsView` — `summary` (default: first userMessage + final agentMessage), `full`, and `notLoaded` — instead of always shipping every item. |
 | Skills & hooks | Supported | `skills/list` reads `.claude/skills/*/SKILL.md` (user+repo scope); `hooks/list` reads `settings.json` hooks, mapping Claude events to Codex `HookEventName` (unmappable events dropped). |
 | Fuzzy file search | Supported | One-shot `fuzzyFileSearch` plus the stateful session API (`sessionStart/Update/Stop`) following Codex 0.157.1: one index per session, `sessionUpdated` then `sessionCompleted` per query, no completion on stop, at most 50 file or directory matches. |
@@ -133,6 +135,9 @@ codex.
   ∈ pending/inProgress/completed); the checklist tool is not also surfaced as a
   timeline item. Plan-mode prose stays on the separate `plan` ThreadItem +
   `item/plan/delta` channel.
+  当前 CLI（2.1.286 实测）默认用 Task 系列工具取代 TodoWrite，而 Task 系列不产生
+  清单通知；适配器固定设置 `CLAUDE_CODE_ENABLE_TODO_TOOLS=1`、`CLAUDE_CODE_ENABLE_TASKS=0`
+  让模型继续使用 TodoWrite，SUBAGENT-003 用真实 CLI 验证清单通知。
 
 ## Robustness notes
 

@@ -19,6 +19,9 @@ export interface McpCallbacks {
   status(name: string, status: string, error: string | null): void
 }
 
+// 操作被取消（连接断开、重载）与服务自身失败的区别：前者不该再继续探测别的服务。
+export class McpOperationCancelled extends ProtocolError {}
+
 // 管理 RPC 不调用 LLM；一次操作共用完成初始化的 MCP 会话，不重放失败的工具。
 export class McpRpc {
   private readonly operations = new Map<AbortController, { peerId: string; done: Promise<void> }>()
@@ -58,6 +61,8 @@ export class McpRpc {
       callbacks.status(name, abort.signal.aborted ? 'cancelled' : 'failed', message)
       if (error instanceof ProtocolError) throw error
       if (error instanceof OAuthLoginRequired) throw error
+      if (abort.signal.aborted)
+        throw new McpOperationCancelled(-32001, `MCP ${name} 操作失败: ${message}`)
       throw new ProtocolError(-32001, `MCP ${name} 操作失败: ${message}`)
     } finally {
       try {
@@ -111,8 +116,15 @@ export class McpRpc {
             const resources = full
               ? await collectPages((cursor) => client.listResources({ cursor }, { signal }))
               : []
+            // 声明了资源能力的服务不一定实现模板目录；"方法不存在"等同于没有模板，
+            // 不能因此把整个服务判为失败。
             const templates = full
-              ? await collectPages((cursor) => client.listResourceTemplates({ cursor }, { signal }))
+              ? await collectPages((cursor) =>
+                  client.listResourceTemplates({ cursor }, { signal }),
+                ).catch((error: unknown) => {
+                  if ((error as { code?: unknown } | null)?.code === -32601) return []
+                  throw error
+                })
               : []
             return {
               name,

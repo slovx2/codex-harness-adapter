@@ -5,7 +5,7 @@
   "type": "module",
   "license": "MIT",
   "engines": {
-    "node": ">=24.14.0"
+    "node": ">=24.0.0"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.282",
@@ -17,7 +17,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && cd ../.. && node --test --test-concurrency=4 packages/claude/dist/claude/test/*.mjs",
+    "test": "npm run build && cd ../.. && node --import ./packages/claude/dist/claude/test/fixtures/isolate-process.mjs --test --test-concurrency=4 --test-timeout=600000 packages/claude/dist/claude/test/*.mjs",
     "start": "node dist/claude/src/adapter.mjs"
   }
 }

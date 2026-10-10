@@ -31,7 +31,7 @@ import { mergeMcpConfig, readMcpConfig } from './mcp.mjs'
 import { sdkMcpServers } from './mcp-config.mjs'
 import { elicitationParams, elicitationResponse } from './mcp-elicitation.mjs'
 import { mcpOAuthManager } from './mcp-oauth.mjs'
-import { type McpCallbacks, McpRpc, type McpScope } from './mcp-rpc.mjs'
+import { type McpCallbacks, McpOperationCancelled, McpRpc, type McpScope } from './mcp-rpc.mjs'
 import { parseContextItems } from './native-context.mjs'
 import { PendingInteractions } from './pending-interactions.mjs'
 import {
@@ -96,9 +96,7 @@ import {
   normalizeUserInputAnswers,
   nullIfEmpty,
   numberOr,
-  parseExitCodeFromResult,
   parseSubagentTrailer,
-  parseWebSearchAction,
   permissionProfileIdFromParams,
   permissionProfileList,
   permissionProfilePolicy,
@@ -112,17 +110,22 @@ import {
   simpleDiff,
   stringListFromEnv,
   stringOr,
+  subagentStructuredResult,
   summarizeRpcParams,
   threadPermissionProfileId,
   todoWriteToPlanSteps,
   tokenBreakdownFromClaudeUsage,
+  toolItemWithResult,
   toolResultText,
   userInputAnswersAsContent,
-  wrapMcpToolError,
-  wrapMcpToolResult,
 } from './server-helpers.mjs'
 import { SkillsRpc } from './skills-rpc.mjs'
 import { PINNED_SECTION_ID, type SessionStore } from './store.mjs'
+import {
+  relayRuntimeEvents,
+  SubagentProjection,
+  subagentRelayPrompt,
+} from './subagent-projection.mjs'
 import { threadAttachmentRequest } from './thread-attachments.mjs'
 import type { ThreadGoal } from './thread-goals.mjs'
 import { patchGitInfo } from './thread-metadata.mjs'
@@ -209,6 +212,8 @@ interface SubagentContext {
   agentPath: string
   prompt: string
   subType: string | null
+  // 子代理过程在子线程里的投影；工作流聚合出的代理没有过程可投影。
+  projection: SubagentProjection | null
 }
 
 interface ActiveSubagentState {
@@ -254,6 +259,8 @@ export class CodexClaudeAppServer {
   >()
   private nativeMutations = new Set<string>()
   private subagentStateByTurn = new Map<string, ActiveSubagentState>()
+  // 子代理追问回合占用父会话：子线程 ID → 父线程 ID，回合结束时释放。
+  private relayParentByChild = new Map<string, string>()
   private readonly fuzzySearch = new FuzzyFileSearch()
   private readonly fuzzySessions = new FuzzySearchSessions((peer, message) =>
     this.notify(peer, message),
@@ -2312,7 +2319,6 @@ export class CodexClaudeAppServer {
         allowedTools: ['Read', 'Glob', 'Grep'],
         addDirs: [],
         skillOverrides: this.skills.runtimeOverrides(thread.cwd),
-        enableFileCheckpointing: false,
         outputFormat: null,
         approvalPolicy: 'never',
         sandboxMode: 'read-only',
@@ -2384,6 +2390,17 @@ export class CodexClaudeAppServer {
       this.store.listTurns(threadId).some((turn) => turn.status === 'inProgress')
     )
       throw new ProtocolError(-32009, '会话已有活动或结果尚未确认的 Turn')
+    // 追问回合要恢复父会话；同一个 Claude 会话不能同时被两个 CLI 进程使用。
+    const relay = this.subagentRelay(thread)
+    if ([...this.relayParentByChild.values()].includes(threadId))
+      throw new ProtocolError(-32009, '子代理正在处理追问，主任务暂时不能开始新回合')
+    if (
+      relay &&
+      (this.activeTurnByThread.has(relay.parent.id) ||
+        this.interruptingByThread.has(relay.parent.id) ||
+        [...this.relayParentByChild.values()].includes(relay.parent.id))
+    )
+      throw new ProtocolError(-32009, '主任务正在运行，子代理暂时不能接收新消息')
     const turnId = newId()
     const input = Array.isArray(params.input) ? (params.input as UserInput[]) : []
     // extractImageInputs splits user input into the text prompt and any image
@@ -2469,6 +2486,7 @@ export class CodexClaudeAppServer {
       purpose: params.outputSchema == null ? 'normal' : 'summary',
     })
     this.markActiveTurn(threadId, turnId)
+    if (relay) this.relayParentByChild.set(threadId, relay.parent.id)
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     const publicTurn = this.toLifecycleTurn(turn)
 
@@ -2653,6 +2671,9 @@ export class CodexClaudeAppServer {
     // parent state so Codex App retains the terminal snapshot.
     const subagentContexts = new Map<string, SubagentContext>()
     const activeSubagents = new Set<string>()
+    // 后台子代理仍计入 activeSubagents（看门狗与收尾都靠它），但不阻塞主模型：
+    // 它运行期间主线程照常输出，所以按“前台子代理数”决定是否抑制主线程事件。
+    const backgroundSubagents = new Set<string>()
     // A Workflow launch can be pending before it has produced a journal
     // agent (or after its last projected agent has completed). Keep the
     // watchdog armed for that whole async operation, not only while a child
@@ -2825,18 +2846,34 @@ export class CodexClaudeAppServer {
       })
     }
 
-    const rawTurnModel = stringOr(params.model, thread.model)
+    // 追问回合跑在父会话上：系统提示、模型、工具面都与父线程的普通回合一致，
+    // 才能命中父会话的提示缓存；子线程只负责展示被恢复的子代理的输出。
+    const relay = turnPurpose === 'normal' ? this.subagentRelay(thread) : null
+    if (relay) {
+      systemPromptAddendum = buildSystemPromptAddendum({
+        baseInstructions: relay.parent.baseInstructions,
+        developerInstructions: relay.parent.developerInstructions,
+        personality: relay.parent.personality,
+        desktopPresentation,
+      })
+      effectivePrompt = subagentRelayPrompt(relay.agentId, prompt)
+    }
+    const runtimeThread = relay?.parent ?? thread
+    const rawTurnModel = relay ? relay.parent.model : stringOr(params.model, thread.model)
     if (turnPurpose === 'normal')
       systemPromptAddendum =
-        [systemPromptAddendum, this.goals.context(thread.id)].filter(Boolean).join('\n\n') || null
+        [systemPromptAddendum, this.goals.context(runtimeThread.id)].filter(Boolean).join('\n\n') ||
+        null
     const isCodexThread = false
     const resolvedModel = isCodexThread
       ? rawTurnModel
       : resolveClaudeModel(rawTurnModel, params.outputSchema == null ? 'normal' : 'summary')
     const resolvedEffort = resolveClaudeEffort(
-      typeof params.effort === 'string'
-        ? params.effort
-        : (thread.reasoningEffort ?? process.env.CHA_CLAUDE_EFFORT ?? null),
+      relay
+        ? (relay.parent.reasoningEffort ?? process.env.CHA_CLAUDE_EFFORT ?? null)
+        : typeof params.effort === 'string'
+          ? params.effort
+          : (thread.reasoningEffort ?? process.env.CHA_CLAUDE_EFFORT ?? null),
     )
     // Log the effective Claude SDK model+effort per turn so when a user
     // reports "switching model didn't work" we can diff App's payload against
@@ -2916,19 +2953,19 @@ export class CodexClaudeAppServer {
         trackGoalTools:
           turnPurpose === 'normal' && this.store.threadGoal(thread.id)?.status === 'active',
         prompt: effectivePrompt,
-        cwd: stringOr(params.cwd, thread.cwd),
+        ...(relay ? { subagentRelay: { agentId: relay.agentId, message: prompt } } : {}),
+        cwd: relay ? relay.parent.cwd : stringOr(params.cwd, thread.cwd),
         runtimeType: isCodexThread ? 'codex-proxy' : null,
         model: resolvedModel,
         effort: resolvedEffort,
-        claudeSessionId: isCodexThread ? thread.codexSessionId : thread.claudeSessionId,
+        claudeSessionId: isCodexThread ? thread.codexSessionId : runtimeThread.claudeSessionId,
         forkSession,
-        mcpServers: this.mcpScope(thread.id).servers,
-        mcpConfigSource: this.mcpScope(thread.id).source,
-        dynamicTools: this.store.threadSettings(thread.id).dynamicTools ?? [],
+        mcpServers: this.mcpScope(runtimeThread.id).servers,
+        mcpConfigSource: this.mcpScope(runtimeThread.id).source,
+        dynamicTools: this.store.threadSettings(runtimeThread.id).dynamicTools ?? [],
         allowedTools: defaultAllowedTools(),
         addDirs: stringListFromEnv('CHA_CLAUDE_ADD_DIRS', []),
         skillOverrides: this.skills.runtimeOverrides(stringOr(params.cwd, thread.cwd)),
-        enableFileCheckpointing: process.env.CHA_CLAUDE_ENABLE_FILE_CHECKPOINTING === '1',
         outputFormat: claudeOutputFormat(params.outputSchema),
         approvalPolicy,
         sandboxMode,
@@ -3087,7 +3124,7 @@ export class CodexClaudeAppServer {
             throw error
           }
         },
-        onEvent: async (event) => {
+        onEvent: relayRuntimeEvents(relay !== null, async (event) => {
           // Interrupts, watchdog expiry, and a peer reconnect can leave a few
           // SDK messages queued after the server has terminalized the turn.
           // They are stale and must never resurrect a child or an inProgress
@@ -3105,7 +3142,29 @@ export class CodexClaudeAppServer {
             this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
             return
           }
-          if (activeSubagents.size > 0) {
+          if (event.type === 'subagent_backgrounded') {
+            if (!activeSubagents.has(event.toolUseId)) return
+            backgroundSubagents.add(event.toolUseId)
+            const ctx = subagentContexts.get(event.toolUseId)
+            const childThread = ctx ? this.store.getThread(ctx.childThreadId) : null
+            if (childThread) {
+              // 与完成时一致：昵称换成 SDK 的 agentId，后续按它寻址这个子代理。
+              childThread.agentNickname = event.agentId
+              this.store.upsertThread(childThread)
+            }
+            return
+          }
+          if (event.type === 'subagent_event') {
+            // 动态工具由原始回调生成生命周期，不再按子代理的工具调用重复投影。
+            if (
+              event.event.type === 'tool_use' &&
+              event.event.toolName.startsWith('mcp__codex_harness_adapter')
+            )
+              return
+            subagentContexts.get(event.agentToolUseId)?.projection?.handle(event.event)
+            return
+          }
+          if (activeSubagents.size > backgroundSubagents.size) {
             if (
               event.type === 'text_delta' ||
               event.type === 'reasoning_delta' ||
@@ -3294,6 +3353,19 @@ export class CodexClaudeAppServer {
               agentPath,
               prompt: promptText,
               subType,
+              projection: new SubagentProjection(
+                {
+                  appendItem: (item) => void this.store.appendItem(childTurn.id, item),
+                  updateItem: (itemId, update) =>
+                    this.store
+                      .updateItem(childTurn.id, itemId, update)
+                      ?.items.find((item) => item.id === itemId) ?? null,
+                  notify: (method, params) => this.notify(peer, { method, params }),
+                  toolItem: (toolEvent) => this.toolUseToItem(toolEvent, thread.cwd),
+                },
+                childThreadId,
+                childTurn.id,
+              ),
             }
             this.emitSubagentActivity(peer, thread.id, turn.id, subagentContext, 'started')
 
@@ -3343,7 +3415,9 @@ export class CodexClaudeAppServer {
             // into the proper protocol fields (agentNickname / tokenUsage /
             // metrics) so the subagent timeline carries the same identity +
             // usage the SDK reports.
-            const parsed = parseSubagentTrailer(rawResultText)
+            // 结构化结果不带模型侧的包装前缀；拿不到时才回退到解析文本尾部。
+            const parsed =
+              subagentStructuredResult(event.structured) ?? parseSubagentTrailer(rawResultText)
             const resultText = parsed.cleanText
 
             const childTurn = this.completeSubagentChildTurn(
@@ -3493,6 +3567,7 @@ export class CodexClaudeAppServer {
             // item have both been persisted. If one of those operations throws,
             // the outer settlement path can still finalize the child as failed.
             activeSubagents.delete(event.toolUseId)
+            backgroundSubagents.delete(event.toolUseId)
             subagentContexts.delete(event.toolUseId)
             if (activeSubagents.size === 0 && !workflowInFlight) disarmWatchdog()
             return
@@ -3688,37 +3763,9 @@ export class CodexClaudeAppServer {
               const started = itemStartedAtMs.get(itemId)
               return started == null ? null : Math.max(0, nowMillis() - started)
             })()
-            const parsedExitCode = parseExitCodeFromResult(event.content) ?? (event.isError ? 1 : 0)
-            const updated = this.store.updateItem(turn.id, itemId, (item) => {
-              if (item.type === 'commandExecution') {
-                return {
-                  ...item,
-                  status: event.isError ? 'failed' : 'completed',
-                  aggregatedOutput: item.aggregatedOutput ?? resultText,
-                  exitCode: parsedExitCode,
-                  durationMs,
-                }
-              }
-              if (item.type === 'fileChange')
-                return { ...item, status: event.isError ? 'failed' : 'completed' }
-              if (item.type === 'mcpToolCall') {
-                // Protocol-correct shape: McpToolCallResult = {content[], structuredContent, _meta};
-                // McpToolCallError = {message}. We previously shipped raw event.content for both
-                // which crashed App's ts-rs deserializer for any tool that returned anything richer
-                // than a primitive. Always wrap into the strict shape.
-                return {
-                  ...item,
-                  status: event.isError ? 'failed' : 'completed',
-                  result: event.isError ? null : wrapMcpToolResult(event.content),
-                  error: event.isError ? wrapMcpToolError(event.content) : null,
-                  durationMs,
-                }
-              }
-              if (item.type === 'webSearch') {
-                return { ...item, action: parseWebSearchAction(item.query, resultText) }
-              }
-              return item
-            })
+            const updated = this.store.updateItem(turn.id, itemId, (item) =>
+              toolItemWithResult(item, event.content, event.isError === true, durationMs),
+            )
             const item = updated?.items.find((candidate) => candidate.id === itemId)
             if (item?.type === 'commandExecution' && resultText && !commandOutputSeen.has(itemId)) {
               this.notify(peer, {
@@ -3826,7 +3873,7 @@ export class CodexClaudeAppServer {
           if (event.type === 'error') {
             throw new Error(event.message)
           }
-        },
+        }),
         onElicitationRequest: async (request, signal) => {
           if (
             typeof approvalPolicy === 'object' &&
@@ -4143,47 +4190,50 @@ export class CodexClaudeAppServer {
       this.store.upsertTurn(childTurn)
     }
 
-    const agentItemId = newId()
-    const startedItem: ThreadItem = {
-      type: 'agentMessage',
-      id: agentItemId,
-      text: '',
-      phase: null,
-      memoryCitation: null,
-    }
-    this.store.appendItem(childTurn.id, startedItem)
-    this.notify(peer, {
-      method: 'item/started',
-      params: {
-        threadId: context.childThreadId,
-        turnId: childTurn.id,
-        item: startedItem,
-        startedAtMs: nowMillis(),
-      },
-    })
-
-    const completedItem: ThreadItem = { ...startedItem, text: resultText }
-    this.store.updateItem(childTurn.id, agentItemId, () => completedItem)
-    if (resultText) {
+    // 过程投影里最后一段正文若就是结果，已原地标为最终回答，不再重复写一条。
+    if (!context.projection?.finish(resultText, status === 'failed')) {
+      const agentItemId = newId()
+      const startedItem: ThreadItem = {
+        type: 'agentMessage',
+        id: agentItemId,
+        text: '',
+        phase: null,
+        memoryCitation: null,
+      }
+      this.store.appendItem(childTurn.id, startedItem)
       this.notify(peer, {
-        method: 'item/agentMessage/delta',
+        method: 'item/started',
         params: {
           threadId: context.childThreadId,
           turnId: childTurn.id,
-          itemId: agentItemId,
-          delta: resultText,
+          item: startedItem,
+          startedAtMs: nowMillis(),
+        },
+      })
+
+      const completedItem: ThreadItem = { ...startedItem, text: resultText }
+      this.store.updateItem(childTurn.id, agentItemId, () => completedItem)
+      if (resultText) {
+        this.notify(peer, {
+          method: 'item/agentMessage/delta',
+          params: {
+            threadId: context.childThreadId,
+            turnId: childTurn.id,
+            itemId: agentItemId,
+            delta: resultText,
+          },
+        })
+      }
+      this.notify(peer, {
+        method: 'item/completed',
+        params: {
+          threadId: context.childThreadId,
+          turnId: childTurn.id,
+          item: completedItem,
+          completedAtMs: nowMillis(),
         },
       })
     }
-    this.notify(peer, {
-      method: 'item/completed',
-      params: {
-        threadId: context.childThreadId,
-        turnId: childTurn.id,
-        item: completedItem,
-        completedAtMs: nowMillis(),
-      },
-    })
 
     const completed = this.store.completeTurn(childTurn.id, status, error) ?? childTurn
     if (durationMs != null) {
@@ -4557,6 +4607,9 @@ export class CodexClaudeAppServer {
       this.store.getTurn(activeTurnId)?.status !== 'inProgress'
     )
       throw new ProtocolError(-32009, '指定回合与当前活动回合不一致')
+    // 追问回合跑在父会话上，回合内追加的输入只会到主模型而到不了子代理。
+    if (this.relayParentByChild.has(threadId))
+      throw new ProtocolError(-32009, '子代理正在处理上一条追问，请等它结束后再发送')
     const startup = this.runtimeReadyByTurn.get(activeTurnId)
     if (startup && !(await startup.ready)) throw new ProtocolError(-32009, '回合未启动便已终结')
     // 等待启动时另一端可能提交相同消息或取消回合，落库前再次核对。
@@ -4645,15 +4698,25 @@ export class CodexClaudeAppServer {
   }
 
   private async mcpProbe(peer: RpcPeer, scope: McpScope): Promise<void> {
-    for (const name of Object.keys(sdkMcpServers(scope.servers)))
-      await this.mcp.withClient(
-        scope,
-        name,
-        this.mcpCallbacks(peer, scope.threadId),
-        async (client, signal) => {
-          await client.ping({ signal })
-        },
-      )
+    // 一个服务失败不能让排在后面的服务没有状态：失败已由状态回调逐个通知，
+    // 这里只把第一个错误留给调用方。操作被取消（连接断开、重载）时立即停止。
+    let failure: unknown
+    for (const name of Object.keys(sdkMcpServers(scope.servers))) {
+      try {
+        await this.mcp.withClient(
+          scope,
+          name,
+          this.mcpCallbacks(peer, scope.threadId),
+          async (client, signal) => {
+            await client.ping({ signal })
+          },
+        )
+      } catch (error) {
+        if (error instanceof McpOperationCancelled) throw error
+        failure ??= error
+      }
+    }
+    if (failure !== undefined) throw failure
   }
 
   private async mcpReload(peer: RpcPeer): Promise<unknown> {
@@ -5560,7 +5623,23 @@ export class CodexClaudeAppServer {
       this.runtimeReadyByTurn.delete(turnId)
     }
     const existed = this.activeTurnByThread.delete(threadId)
+    this.relayParentByChild.delete(threadId)
     if (existed && this.activeTurnByThread.size === 0) this.idleCheckHandler?.()
+  }
+
+  // 子代理线程上的用户输入只能经父会话转给该子代理：SDK 没有宿主直连子代理的接口，
+  // 但主模型的 SendMessage 可以按 agentId 把已结束的子代理连同上下文恢复。
+  private subagentRelay(thread: ThreadRecord): { parent: ThreadRecord; agentId: string } | null {
+    if (thread.threadSource !== 'subagent') return null
+    const parent = thread.forkedFromId ? this.store.getThread(thread.forkedFromId) : null
+    const agentId = thread.agentNickname ?? ''
+    if (
+      !parent?.claudeSessionId ||
+      thread.agentRole === 'workflow' ||
+      !/^[0-9a-f]{8,32}$/i.test(agentId)
+    )
+      throw new ProtocolError(-32009, '这个子代理没有可恢复的记录，不能继续对话')
+    return { parent, agentId }
   }
 
   private peerForParams(peer: RpcPeer, params: unknown): RpcPeer {

@@ -263,6 +263,8 @@ export interface FileUpdateChange {
 }
 
 export interface RuntimeTurnContext {
+  // 子代理追问回合：主会话只负责用 SendMessage 把用户原文转给该子代理。
+  subagentRelay?: { agentId: string; message: string }
   permissionTools?: boolean
   permissionGrants?: import('./permission-grants.mjs').PermissionOverlay
   goalTools?: boolean
@@ -286,7 +288,6 @@ export interface RuntimeTurnContext {
   allowedTools: string[] | null
   addDirs: string[]
   skillOverrides?: Record<string, 'on' | 'off'>
-  enableFileCheckpointing: boolean
   outputFormat: unknown | null
   approvalPolicy: ApprovalPolicy | null
   sandboxMode: string | null
@@ -327,7 +328,18 @@ export type RuntimeEvent =
   | { type: 'reasoning_delta'; delta: string }
   | { type: 'tool_use'; toolUseId: string; toolName: string; input: Record<string, unknown> }
   | { type: 'tool_output_delta'; toolUseId: string; delta: string }
-  | { type: 'tool_result'; toolUseId: string; content: unknown; isError?: boolean }
+  | {
+      type: 'tool_result'
+      toolUseId: string
+      content: unknown
+      isError?: boolean
+      // SDK 的结构化工具结果（tool_use_result）；子代理的正文与用量以它为准。
+      structured?: unknown
+    }
+  // Agent 工具返回的只是后台启动回执：子代理仍在运行，结果稍后以 tool_result 送达。
+  | { type: 'subagent_backgrounded'; toolUseId: string; agentId: string }
+  // 子代理内部的正文、思考与工具调用，按所属 Agent 工具调用投影到子线程。
+  | { type: 'subagent_event'; agentToolUseId: string; event: SubagentInnerEvent }
   | {
       type: 'permission_request'
       requestId: string
@@ -368,6 +380,12 @@ export type RuntimeEvent =
     }
   | { type: 'completed'; claudeSessionId?: string | null; result?: string | null; success: boolean }
   | { type: 'error'; message: string }
+
+export type SubagentInnerEvent =
+  | { type: 'text'; text: string }
+  | { type: 'reasoning'; text: string }
+  | { type: 'tool_use'; toolUseId: string; toolName: string; input: Record<string, unknown> }
+  | { type: 'tool_result'; toolUseId: string; content: unknown; isError?: boolean }
 
 // Codex's request_user_input primitive — surfaces Claude's AskUserQuestion as a
 // native choice card in the App instead of a generic mcpToolCall blob. Matches

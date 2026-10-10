@@ -16,7 +16,6 @@ const context: RuntimeTurnContext = {
   mcpServers: null,
   allowedTools: null,
   addDirs: [],
-  enableFileCheckpointing: false,
   outputFormat: null,
   approvalPolicy: 'never',
   sandboxMode: 'danger-full-access',
@@ -163,7 +162,16 @@ test('nested assistant events do not split or contaminate parent messages', asyn
       { ...assistant('child', [text('Hidden child prose')]), parent_tool_use_id: 'parent-tool' },
       assistant('parent', [text('Parent')]),
     ]),
-    [{ type: 'message_boundary' }, { type: 'text_delta', delta: 'Parent' }],
+    [
+      { type: 'message_boundary' },
+      { type: 'text_delta', delta: 'Parent' },
+      // 子代理的正文按完整内容块归到它自己的线程，不进入父消息，也不重复流式增量。
+      {
+        type: 'subagent_event',
+        agentToolUseId: 'parent-tool',
+        event: { type: 'text', text: 'Hidden child prose' },
+      },
+    ],
   )
 })
 

@@ -136,6 +136,13 @@ interface PendingTurn {
   pendingUserMessage: null | { resolve: (v: { message: unknown }) => void }
   deferredResult: PendingTurnResult | null
   workflowFailure: string | null
+  // CLI 上报的会话状态。idle 表示后台子代理及其通知触发的续跑都已结束；
+  // null 表示本轮 CLI 没有上报过状态，回合仍在第一条 result 处结束。
+  sessionState: 'idle' | 'running' | 'requires_action' | null
+  // 后台子代理：task_id（即 agentId）→ Agent 工具调用 ID，结果以 task_notification 为准。
+  backgroundAgents: Map<string, string>
+  // 各子代理最近一段正文，后台子代理结束时作为它的结果。
+  subagentText: Map<string, string>
 }
 
 interface PendingTurnResult {
@@ -326,6 +333,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
           pendingUserMessage: null,
           deferredResult: null,
           workflowFailure: null,
+          sessionState: null,
+          backgroundAgents: new Map(),
+          subagentText: new Map(),
         }
         this.turns.set(context.turnId, pending)
         settingsReady(pending)
@@ -596,6 +606,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       pathToClaudeCodeExecutable: hostClaudeExecutable(),
       includePartialMessages: true,
       includeHookEvents: true,
+      // 子代理的正文与思考也带父工具调用 ID 转发，用于投影到子线程。
+      forwardSubagentText: true,
       cwd: context.cwd,
       settingSources: ['user', 'project', 'local'],
       // 失败后由持久化状态对账；禁止 CLI 自行重放可能已接收的模型请求。
@@ -604,6 +616,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         ...sdkMcpStartupEnvironment(context.mcpServers),
         CLAUDE_CODE_MAX_RETRIES: '0',
         CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK: '1',
+        // 清单只映射 TodoWrite：新模型默认不提供清单工具，旧模型默认提供未映射的 Task*。
+        CLAUDE_CODE_ENABLE_TODO_TOOLS: '1',
+        CLAUDE_CODE_ENABLE_TASKS: '0',
+        // 让 CLI 上报会话状态，用 idle 判断后台子代理与续跑是否全部结束。
+        CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1',
       },
       ...runtimePermissionOptions(context, originalBashInputs),
       settings: {
@@ -697,6 +714,34 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         },
       ],
     })
+
+    const relay = context.subagentRelay
+    if (relay)
+      permissionHooks.PreToolUse.push({
+        hooks: [
+          async (event: Record<string, unknown>) => {
+            // 被恢复的子代理自己的工具调用照常走权限流程。
+            if (typeof event.agent_id === 'string') return {}
+            if (event.tool_name !== 'SendMessage')
+              return {
+                hookSpecificOutput: {
+                  hookEventName: 'PreToolUse',
+                  permissionDecision: 'deny',
+                  permissionDecisionReason:
+                    '本回合只负责把用户的话转给子代理：请调用 SendMessage，不要调用其他工具。',
+                },
+              }
+            // 收件人与正文由适配器写定，模型的转述不会改动用户原文。
+            return {
+              hookSpecificOutput: {
+                hookEventName: 'PreToolUse',
+                permissionDecision: 'allow',
+                updatedInput: { to: relay.agentId, message: relay.message },
+              },
+            }
+          },
+        ],
+      })
 
     if (parseWorkflowCommand(context.prompt)?.type === 'run') {
       opts.settings = {
@@ -1046,6 +1091,21 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         message.task_id,
         message.tool_use_id,
       )
+    if (subtype === 'session_state_changed') {
+      const state = message.state
+      if (state !== 'idle' && state !== 'running' && state !== 'requires_action') return
+      pending.sessionState = state
+      if (state === 'idle') await this.finishDeferredResult(pending)
+      return
+    }
+    if (subtype === 'task_notification' && typeof message.task_id === 'string') {
+      const agentToolUseId = pending.backgroundAgents?.get(message.task_id)
+      if (agentToolUseId) {
+        pending.backgroundAgents?.delete(message.task_id)
+        await this.finishBackgroundAgent(pending, agentToolUseId, message)
+        return
+      }
+    }
     if (subtype === 'hook_started' || subtype === 'hook_progress' || subtype === 'hook_response') {
       if (typeof message.hook_id !== 'string' || !message.hook_id) return
       await pending.handlers.onEvent({
@@ -1401,8 +1461,20 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       await this.beginAssistantMessage(pending, stringOrNull(inner.id))
     }
     const content = (inner.content as Array<Record<string, unknown>>) || []
+    const agentToolUseId = stringOrNull(message.parent_tool_use_id)
     for (const block of content) {
       const blockType = String(block.type ?? '')
+      if (agentToolUseId && (blockType === 'text' || blockType === 'thinking')) {
+        const text = String((blockType === 'text' ? block.text : block.thinking) ?? '')
+        if (!text) continue
+        if (blockType === 'text') (pending.subagentText ??= new Map()).set(agentToolUseId, text)
+        await pending.handlers.onEvent({
+          type: 'subagent_event',
+          agentToolUseId,
+          event: { type: blockType === 'text' ? 'text' : 'reasoning', text },
+        })
+        continue
+      }
       if (blockType === 'text') {
         if (nestedMessage || pending.activeSubagents.size > 0) continue
         const text = this.unstreamedBlockText(pending, 'text', String(block.text ?? ''))
@@ -1430,7 +1502,16 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         if (isSubagentTool(name)) {
           pending.activeSubagents.add(id)
         }
-        if (parentSubagent && !isSubagentTool(name)) continue
+        if (parentSubagent && !isSubagentTool(name)) {
+          // 子代理自己的工具调用归到它的子线程；提问仍由 canUseTool 桥接到父线程。
+          if (agentToolUseId && name !== 'StructuredOutput' && name !== 'AskUserQuestion')
+            await pending.handlers.onEvent({
+              type: 'subagent_event',
+              agentToolUseId,
+              event: { type: 'tool_use', toolUseId: id, toolName: name, input },
+            })
+          continue
+        }
         if (name === 'StructuredOutput') {
           // Defer emission; the final coercion happens at result-time.
           continue
@@ -1461,21 +1542,46 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       ? (inner.content as Array<Record<string, unknown>>)
       : []
     const toolResultCount = content.filter((block) => String(block.type) === 'tool_result').length
+    const agentToolUseId = stringOrNull(message.parent_tool_use_id)
+    // SDK 每条用户消息只带一份结构化结果；多个结果并存时无法归属，不使用。
+    const structured = toolResultCount === 1 ? workflowLaunchResult : undefined
     for (const block of content) {
       if (String(block.type) !== 'tool_result') continue
       const toolUseId = String(block.tool_use_id ?? '')
       if (!toolUseId) continue
-      const isWorkflowLaunch = pending.workflowToolUseIds?.delete(toolUseId) === true
-      const wasSubagent = pending.activeSubagents.delete(toolUseId)
-      // Even if this was a subagent we still emit its tool_result so the
-      // server's subagent state machine closes the collabAgentToolCall.
       const isError = Boolean(block.is_error)
       const bodyContent = block.content
+      if (agentToolUseId && !pending.activeSubagents.has(toolUseId)) {
+        await pending.handlers.onEvent({
+          type: 'subagent_event',
+          agentToolUseId,
+          event: { type: 'tool_result', toolUseId, content: bodyContent, isError },
+        })
+        continue
+      }
+      const isWorkflowLaunch = pending.workflowToolUseIds?.delete(toolUseId) === true
+      const wasSubagent = pending.activeSubagents.delete(toolUseId)
+      const backgroundAgentId =
+        wasSubagent && !isWorkflowLaunch && !isError ? asyncAgentLaunchId(structured) : null
+      if (backgroundAgentId) {
+        // Agent 默认后台运行，此时拿到的只是启动回执。子代理的结果以
+        // task_notification 为准；主模型在此期间继续输出，不再按子代理抑制。
+        ;(pending.backgroundAgents ??= new Map()).set(backgroundAgentId, toolUseId)
+        await pending.handlers.onEvent({
+          type: 'subagent_backgrounded',
+          toolUseId,
+          agentId: backgroundAgentId,
+        })
+        continue
+      }
+      // Even if this was a subagent we still emit its tool_result so the
+      // server's subagent state machine closes the collabAgentToolCall.
       await pending.handlers.onEvent({
         type: 'tool_result',
         toolUseId,
         content: bodyContent,
         isError,
+        ...(structured === undefined ? {} : { structured }),
       })
       if (!workflowLaunchAttached && isWorkflowLaunch && toolResultCount === 1) {
         workflowLaunchAttached = true
@@ -1765,6 +1871,35 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     return false
   }
 
+  // 后台子代理结束：把它最后一段正文作为结果交给协议层收尾子线程。
+  private async finishBackgroundAgent(
+    pending: PendingTurn,
+    toolUseId: string,
+    message: Record<string, unknown>,
+  ): Promise<void> {
+    const text = pending.subagentText?.get(toolUseId) ?? String(message.summary ?? '').trim()
+    pending.subagentText?.delete(toolUseId)
+    const usage = workflowTaskUsage(message.usage)
+    await pending.handlers.onEvent({
+      type: 'tool_result',
+      toolUseId,
+      content: text,
+      isError: message.status !== 'completed',
+      structured: {
+        status: 'completed',
+        agentId: message.task_id,
+        content: [{ type: 'text', text }],
+        ...(usage
+          ? {
+              totalTokens: usage.totalTokens,
+              totalToolUseCount: usage.toolUses,
+              totalDurationMs: usage.durationMs,
+            }
+          : {}),
+      },
+    })
+  }
+
   private async finishDeferredResult(pending: PendingTurn, force = false): Promise<void> {
     const deferred = pending.deferredResult
     if (!deferred || pending.resolved) return
@@ -1774,6 +1909,14 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
     if (!force && deferred.success && !pending.input.consumedBy(deferred.inputReceipt)) return
     if (!force && deferred.success && this.hasPendingWorkflowTasks(pending)) return
+    // 后台子代理结束后 CLI 会自行续跑一轮并再发一条 result；idle 之前回合都没有结束。
+    if (
+      !force &&
+      deferred.success &&
+      pending.sessionState != null &&
+      pending.sessionState !== 'idle'
+    )
+      return
 
     pending.deferredResult = null
     pending.resolved = true
@@ -1929,6 +2072,13 @@ function isSubagentTool(name: string): boolean {
   return (
     n === 'task' || n === 'agent' || n === 'subagent' || n === 'spawn_agent' || n === 'spawnagent'
   )
+}
+
+// Agent 工具的结构化结果为 async_launched 时返回后台子代理的 agentId。
+function asyncAgentLaunchId(value: unknown): string | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const result = value as Record<string, unknown>
+  return result.status === 'async_launched' ? stringOrNull(result.agentId) : null
 }
 
 function isWorkflowTool(name: string): boolean {

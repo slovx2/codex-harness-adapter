@@ -37,6 +37,13 @@ rl.on('line', (line) => {
     return
   }
   if (request.method === 'resources/templates/list') {
+    // 声明了资源能力却不实现模板目录的服务很常见：按协议返回"方法不存在"。
+    if (process.argv.includes('--no-resource-templates')) {
+      process.stdout.write(
+        `${JSON.stringify({ jsonrpc: '2.0', id: request.id, error: { code: -32601, message: 'Method not found' } })}\n`,
+      )
+      return
+    }
     respond(request.id, { resourceTemplates: [] })
     return
   }

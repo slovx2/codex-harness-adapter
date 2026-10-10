@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
+import { type ChildProcess, execFileSync, spawn as spawnProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
@@ -8,14 +8,31 @@ import net from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { Duplex } from 'node:stream'
-import test from 'node:test'
+import test, { after } from 'node:test'
 import WebSocket from 'ws'
 import type { ProviderLoopConfigProjectionResult } from '../src/provider-loop-config.mjs'
 import { SessionStore } from '../src/store.mjs'
+import { isolatedEnv } from './fixtures/isolated-env.mjs'
 import { LocalMcp } from './fixtures/mcp-http.mjs'
 
 const adapter = resolve('packages/claude/dist/claude/src/adapter.mjs')
 const shim = resolve('scripts/codex-shim')
+
+// 用例超时或中途抛错时不能留下被测进程：它们会让测试文件永远不退出。
+const spawned = new Set<ChildProcess>()
+const spawn = ((...args: any[]) => {
+  const child = (spawnProcess as any)(...args) as ChildProcess
+  spawned.add(child)
+  child.once('exit', () => spawned.delete(child))
+  return child
+}) as typeof spawnProcess
+after(() => {
+  for (const child of spawned) child.kill('SIGKILL')
+})
+
+// 被测进程不再输出时用例应当失败，而不是无限挂起。
+const READ_TIMEOUT_MS = 60_000
+const RESPONSE_TIMEOUT_MS = 120_000
 
 test('server dispatch covers current Codex app-server client method surface', async () => {
   const source = await readFile(resolve('packages/claude/src/server.mts'), 'utf8')
@@ -139,7 +156,7 @@ test('stdio initialize -> thread/start -> turn/start streams mock response', asy
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -213,7 +230,7 @@ test('permission profile selection applies full access without legacy sandbox fi
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -285,7 +302,7 @@ test('run registry records thread and turn lifecycle without raw prompt or respo
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -353,7 +370,7 @@ test('primary turn lifecycle keeps lightweight notLoaded envelopes', async () =>
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -424,7 +441,7 @@ test('thread/turns/list honors default summary and explicit itemsView', async ()
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -486,7 +503,7 @@ test('MCP 服务无法启动时通知失败，状态查询不能返回空成功'
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -537,12 +554,87 @@ test('MCP 服务无法启动时通知失败，状态查询不能返回空成功'
   }
 })
 
+test('启动探测遇到失败的 MCP 服务后继续探测其余服务', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'codex-harness-adapter-test-'))
+  const fixture = resolve('packages/claude/test/fixtures/mcp-stdio-server.mjs')
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...isolatedEnv,
+      CODEX_HOME: home,
+      CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
+      CHA_CLAUDE_MOCK: '1',
+      NODE_NO_WARNINGS: '1',
+      // 启动失败的服务排在前面：它不能让排在后面的服务没有状态。
+      CHA_CLAUDE_MCP_SERVERS: JSON.stringify({
+        broken: { type: 'stdio', command: 'missing-mcp-command' },
+        fixture: { type: 'stdio', command: process.execPath, args: [fixture] },
+      }),
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'initialize',
+        params: { clientInfo: { name: 'test', title: 'Test', version: '0' }, capabilities: null },
+      }),
+    )
+    const seen = new Map<string, string>()
+    while (seen.get('broken') !== 'failed' || seen.get('fixture') !== 'ready') {
+      const message = await reader.next(15_000)
+      if (message.method === 'mcpServer/startupStatus/updated')
+        seen.set(message.params.name, message.params.status)
+    }
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('MCP 服务没有实现资源模板目录时，状态查询仍列出工具与资源', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'codex-harness-adapter-test-'))
+  const fixture = resolve('packages/claude/test/fixtures/mcp-stdio-server.mjs')
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...isolatedEnv,
+      CODEX_HOME: home,
+      CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
+      CHA_CLAUDE_MOCK: '1',
+      NODE_NO_WARNINGS: '1',
+      CHA_CLAUDE_MCP_SERVERS: JSON.stringify({
+        fixture: {
+          type: 'stdio',
+          command: process.execPath,
+          args: [fixture, '--no-resource-templates'],
+        },
+      }),
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'mcpServerStatus/list', params: {} }))
+    const response = await reader.nextResponse(1, 30_000)
+    assert.equal(response.error, undefined, JSON.stringify(response.error))
+    const entry = response.result.data[0]
+    assert.equal(entry.name, 'fixture')
+    assert.equal(entry.tools.echo.name, 'echo')
+    assert.equal(entry.resources[0].uri, 'fixture://resource')
+    assert.deepEqual(entry.resourceTemplates, [])
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('Claude 入口拒绝 GPT 模型，恢复不会改变引擎', async () => {
   const home = await mkdtemp(join(tmpdir(), 'codex-harness-adapter-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -589,7 +681,7 @@ test('model/list follows the native Claude catalog with Codex-safe reasoning eff
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -715,7 +807,7 @@ test('config/read exposes sanitized provider loop selection over stdio', async (
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_PROVIDER: 'codex',
@@ -773,7 +865,7 @@ test('config/read resolves saved provider loop selection without projecting raw 
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_PROVIDER: '',
@@ -839,7 +931,7 @@ test('config writes persist across adapter restarts', async () => {
     const first = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
-        ...process.env,
+        ...isolatedEnv,
         CODEX_HOME: home,
         CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
         CHA_CLAUDE_MOCK: '1',
@@ -868,7 +960,7 @@ test('config writes persist across adapter restarts', async () => {
     const second = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
-        ...process.env,
+        ...isolatedEnv,
         CODEX_HOME: home,
         CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
         CHA_CLAUDE_MOCK: '1',
@@ -910,7 +1002,7 @@ test('无效持久化模型明确停止启动，不静默换模型或覆盖配�
   try {
     const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
       env: {
-        ...process.env,
+        ...isolatedEnv,
         CODEX_HOME: home,
         CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
         CHA_CLAUDE_MOCK: '1',
@@ -935,7 +1027,7 @@ test('Fable and Opus picker aliases reach the runtime without changing plan mode
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -1010,7 +1102,7 @@ for (const configuredModels of ['sonnet', '["sonnet"]', '[{"id":"sonnet"}]']) {
     const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
-        ...process.env,
+        ...isolatedEnv,
         CODEX_HOME: home,
         CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
         CHA_CLAUDE_MOCK: '1',
@@ -1039,7 +1131,7 @@ test('Codex++ model and effort selections map into Claude runtime context', asyn
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -1106,7 +1198,7 @@ test('Codex app config payload model and effort map into Claude runtime context'
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -1165,7 +1257,7 @@ test('Codex app model ids and outputSchema map into Claude runtime context', asy
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -1241,7 +1333,7 @@ test('Codex title-generation turn runs through the runtime instead of a hardcode
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -1344,7 +1436,7 @@ test('stateful HTTP bridge runtimes keep Codex title-generation turns local', as
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_RUNTIME_TYPE: 'agent-http',
@@ -1412,7 +1504,7 @@ test('default runtime tool policy leaves Claude Code tools unrestricted unless e
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -1465,7 +1557,7 @@ test('unix websocket app-server accepts initialize', { timeout: 15_000 }, async 
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', `unix://${sock}`], {
     stdio: ['ignore', 'ignore', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -1505,7 +1597,7 @@ test('unix daemon keeps active turns alive across peer reconnect', async () => {
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', `unix://${sock}`], {
     stdio: ['ignore', 'ignore', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -1584,7 +1676,7 @@ test('unix daemon recovers stale in-progress turns after process restart', async
   let proc = spawn(process.execPath, [adapter, 'app-server', '--listen', `unix://${sock}`], {
     stdio: ['ignore', 'ignore', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -1636,7 +1728,7 @@ test('unix daemon recovers stale in-progress turns after process restart', async
     proc = spawn(process.execPath, [adapter, 'app-server', '--listen', `unix://${sock}`], {
       stdio: ['ignore', 'ignore', 'pipe'],
       env: {
-        ...process.env,
+        ...isolatedEnv,
         CODEX_HOME: home,
         CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
         CHA_CLAUDE_MOCK: '1',
@@ -1675,7 +1767,7 @@ test('stdio app-server recovers stale in-progress turns after process restart', 
   let proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -1723,7 +1815,7 @@ test('stdio app-server recovers stale in-progress turns after process restart', 
     proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
-        ...process.env,
+        ...isolatedEnv,
         CODEX_HOME: home,
         CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
         CHA_CLAUDE_MOCK: '1',
@@ -2034,7 +2126,7 @@ test('app-server proxy forwards websocket handshake bytes to unix daemon', {
   const daemon = spawn(process.execPath, [adapter, 'app-server', '--listen', `unix://${sock}`], {
     stdio: ['ignore', 'ignore', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -2044,7 +2136,7 @@ test('app-server proxy forwards websocket handshake bytes to unix daemon', {
   const proxy = spawn(process.execPath, [adapter, 'app-server', 'proxy', '--sock', sock], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -2085,7 +2177,7 @@ test('app-server proxy carries websocket JSON-RPC traffic over stdio', {
   const daemon = spawn(process.execPath, [adapter, 'app-server', '--listen', `unix://${sock}`], {
     stdio: ['ignore', 'ignore', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -2095,7 +2187,7 @@ test('app-server proxy carries websocket JSON-RPC traffic over stdio', {
   const proxy = spawn(process.execPath, [adapter, 'app-server', 'proxy', '--sock', sock], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -2144,7 +2236,7 @@ test('remote shim launches daemon and proxy with Codex-compatible commands', {
   const daemon = spawn(shim, ['app-server', '--listen', `unix://${sock}`], {
     stdio: ['ignore', 'ignore', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_ADAPTER: adapter,
@@ -2155,7 +2247,7 @@ test('remote shim launches daemon and proxy with Codex-compatible commands', {
   const proxy = spawn(shim, ['app-server', 'proxy', '--sock', sock], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_ADAPTER: adapter,
@@ -2199,7 +2291,7 @@ test('remote utility methods use v2 response shapes', async () => {
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -2255,7 +2347,7 @@ test('process/spawn supports argv, errors, and debug logs terminal lifecycle', a
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_DEBUG_LOG: debugLog,
@@ -2320,7 +2412,7 @@ test('review/start and thread/compact/start emit real turn items', async () => {
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -2402,7 +2494,7 @@ test('Claude thinking maps to a Codex reasoning summary without duplicate raw co
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -2457,7 +2549,7 @@ test('Claude token usage maps to thread/tokenUsage/updated notifications', async
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -2525,7 +2617,7 @@ test('baseInstructions / developerInstructions / personality flow into the syste
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -2584,7 +2676,7 @@ test('Claude hook events are rendered as Codex hookPrompt ThreadItems', async ()
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -2638,7 +2730,7 @@ test('thread/compact/start drives Claude (summary model) instead of the local st
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -2714,7 +2806,7 @@ test('localImage user input becomes a multimodal Claude prompt + an imageView Th
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -2773,7 +2865,7 @@ test('Claude WebSearch tool maps to native Codex webSearch ThreadItem with actio
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -2835,7 +2927,7 @@ test('modelProvider/capabilities/read advertises webSearch=true unless CHA_CLAUD
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -2856,7 +2948,7 @@ test('modelProvider/capabilities/read advertises webSearch=true unless CHA_CLAUD
 test('config/value/write persists arbitrary settings keys across restarts', async () => {
   const home = await mkdtemp(join(tmpdir(), 'codex-harness-adapter-test-'))
   const env = {
-    ...process.env,
+    ...isolatedEnv,
     CODEX_HOME: home,
     CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
     CHA_CLAUDE_MOCK: '1',
@@ -2924,7 +3016,7 @@ test('thread/inject_items 不支持真实追加的后端必须拒绝且不能伪
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -2969,7 +3061,7 @@ test('turn/start planMode=true flows into Claude SDK permission_mode plan', asyn
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -3019,7 +3111,7 @@ test('TodoWrite maps to a Codex v2 turn/plan/updated notification, not a timelin
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -3078,7 +3170,7 @@ test('Codex App approvalPolicy=never + sandbox=danger-full-access auto-accepts t
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -3147,7 +3239,7 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -3566,7 +3658,7 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
     const restarted = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
-        ...process.env,
+        ...isolatedEnv,
         CODEX_HOME: home,
         CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
         CHA_CLAUDE_MOCK: '1',
@@ -3667,7 +3759,7 @@ test('Codex cc 26.818 settles subagents without the unsupported completed activi
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -3784,7 +3876,7 @@ test('subagent without a terminal result emits interrupted activity and failed w
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -3861,7 +3953,7 @@ test('bare /workflows lists prior workflow runs without invoking the model', asy
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -3924,7 +4016,7 @@ test('thread/start picks up effort from config.model_reasoning_effort when top-l
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -3986,7 +4078,7 @@ test('thread/start coerces invalid threadSource / source values so Codex App nev
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -4072,7 +4164,7 @@ test('thread/start with ephemeral=true is hidden from thread/list and surfaces t
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -4177,7 +4269,7 @@ test('approval requests round-trip through Codex server requests', {
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -4257,7 +4349,7 @@ test('generic Claude tools complete as Codex mcpToolCall items', async () => {
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -4320,7 +4412,7 @@ test('turn/steer appends user input to an active Claude turn', async () => {
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -4402,7 +4494,7 @@ test('AskUserQuestion is bridged to Codex item/tool/requestUserInput', async () 
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -4511,7 +4603,7 @@ test('compatibility-only UI methods return schema-shaped responses', async () =>
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -4591,7 +4683,7 @@ test('file change approval emits patch and git diff updates', { timeout: 15_000 
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -4697,7 +4789,7 @@ test('gitDiffToRemote 与 Codex 一致：以最近的远端基准比较，含未
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -4742,7 +4834,7 @@ test('thread resume, fork, and interrupt lifecycle methods are stable', async ()
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -5544,7 +5636,7 @@ test('interrupt during final git diff cannot overwrite an interrupted turn', asy
         cwd: resolve('.'),
         stdio: 'pipe',
         env: {
-          ...process.env,
+          ...isolatedEnv,
           PATH: `${bin}:${process.env.PATH ?? ''}`,
           CHA_CLAUDE_REAL_GIT: realGit,
           CHA_CLAUDE_TEST_GIT_DIFF_STARTED: diffStarted,
@@ -5562,7 +5654,7 @@ test('MCP 子进程退出必须返回明确错误', async () => {
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -5590,7 +5682,7 @@ test('direct MCP stdio resource and tool calls work', async () => {
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -5644,7 +5736,7 @@ test('mcpServerStatus/list enumerates tools and resources from the server', asyn
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -5681,7 +5773,7 @@ test('fuzzyFileSearch 会话与 Codex 一致：先响应后通知、每次搜索
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -5788,7 +5880,7 @@ test('fuzzyFileSearch 遍历部分出错（不可读目录、软链接循环）�
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -5817,7 +5909,7 @@ test('thread/backgroundTerminals 列出、分页、结束与清理本轮后台 s
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -5944,7 +6036,7 @@ test('skills/list and hooks/list surface Claude Code skills and settings hooks',
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       HOME: home,
@@ -6009,7 +6101,7 @@ test('direct MCP HTTP tool calls work', async () => {
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -6083,7 +6175,7 @@ test('optional auto worktree binds new threads to isolated git worktrees', async
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -6122,15 +6214,28 @@ class JsonLineReader {
     proc.stdout.on('data', (chunk: string) => this.push(chunk))
   }
 
-  next(): Promise<any> {
+  next(timeoutMs = READ_TIMEOUT_MS): Promise<any> {
     const existing = this.queue.shift()
     if (existing) return Promise.resolve(existing)
-    return new Promise((resolve) => this.waiters.push(resolve))
+    return new Promise((resolve, reject) => {
+      const waiter = (value: any) => {
+        clearTimeout(timer)
+        resolve(value)
+      }
+      const timer = setTimeout(() => {
+        this.waiters = this.waiters.filter((item) => item !== waiter)
+        reject(new Error(`等待被测进程输出超过 ${timeoutMs}ms`))
+      }, timeoutMs)
+      this.waiters.push(waiter)
+    })
   }
 
-  async nextResponse(id: number): Promise<any> {
+  async nextResponse(id: number, timeoutMs = RESPONSE_TIMEOUT_MS): Promise<any> {
+    const deadline = Date.now() + timeoutMs
     for (;;) {
-      const msg = await this.next()
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) throw new Error(`等待响应 ${id} 超过 ${timeoutMs}ms`)
+      const msg = await this.next(Math.min(remaining, READ_TIMEOUT_MS))
       if (msg.id === id && msg.method == null) return msg
     }
   }
@@ -6163,15 +6268,28 @@ class WebSocketJsonReader {
     })
   }
 
-  next(): Promise<any> {
+  next(timeoutMs = READ_TIMEOUT_MS): Promise<any> {
     const existing = this.queue.shift()
     if (existing) return Promise.resolve(existing)
-    return new Promise((resolve) => this.waiters.push(resolve))
+    return new Promise((resolve, reject) => {
+      const waiter = (value: any) => {
+        clearTimeout(timer)
+        resolve(value)
+      }
+      const timer = setTimeout(() => {
+        this.waiters = this.waiters.filter((item) => item !== waiter)
+        reject(new Error(`等待被测进程输出超过 ${timeoutMs}ms`))
+      }, timeoutMs)
+      this.waiters.push(waiter)
+    })
   }
 
-  async nextResponse(id: number): Promise<any> {
+  async nextResponse(id: number, timeoutMs = RESPONSE_TIMEOUT_MS): Promise<any> {
+    const deadline = Date.now() + timeoutMs
     for (;;) {
-      const msg = await this.next()
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) throw new Error(`等待响应 ${id} 超过 ${timeoutMs}ms`)
+      const msg = await this.next(Math.min(remaining, READ_TIMEOUT_MS))
       if (msg.id === id && msg.method == null) return msg
     }
   }
@@ -6330,7 +6448,7 @@ async function waitForStderr(proc: ChildProcess, pattern: RegExp): Promise<void>
 test('thread/list honors isPinned and metadata updates persist the pin state', async () => {
   const home = await mkdtemp(join(tmpdir(), 'codex-harness-adapter-test-'))
   const env = {
-    ...process.env,
+    ...isolatedEnv,
     CODEX_HOME: home,
     CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
     CHA_CLAUDE_MOCK: '1',
@@ -6390,7 +6508,7 @@ test('Codex section pin RPC moves a thread into and out of the reserved pinned s
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -6461,7 +6579,7 @@ test('thread/settings/update preserves model and effort compatibility', async ()
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -6519,7 +6637,7 @@ test('thread sections paginate without losing entries at page boundaries', async
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',
@@ -6566,7 +6684,7 @@ test('thread/start 允许回退时，不可用的客户端默认模型换成已�
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnv,
       CODEX_HOME: home,
       CHA_CLAUDE_HOME: join(home, 'codex-harness-adapter'),
       CHA_CLAUDE_MOCK: '1',

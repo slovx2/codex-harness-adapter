@@ -530,6 +530,23 @@ createInterface({input:process.stdin}).on('line',line=>{
     blockedRelease({ text: 'ignored after stop' })
     assert.equal((await completed(stopped.turn.id)).params.turn.status, 'interrupted')
     assert.equal(server.active.size, 0)
+    // 被打断的请求没有用量，不能把桌面的上下文占用清零。
+    assert.equal(
+      messages.desktop!.some(
+        (m) =>
+          m.method === 'thread/tokenUsage/updated' && m.params.tokenUsage.last.totalTokens === 0,
+      ),
+      false,
+    )
+    const beforeResume = messages.mobile!.length
+    await ok('mobile', 'thread/resume', { threadId })
+    const restoredUsage = await wait(
+      'mobile',
+      (m) =>
+        messages.mobile!.indexOf(m) >= beforeResume && m.method === 'thread/tokenUsage/updated',
+    )
+    assert.equal(restoredUsage.params.tokenUsage.last.totalTokens, 15)
+    assert.equal(restoredUsage.params.tokenUsage.modelContextWindow, 32000)
     assert.equal((await ok('desktop', 'thread/queue/list', { threadId })).data.length, 1)
     replies.push({ text: 'queue resumed' })
     const queued = await ok('desktop', 'thread/queue/start', { threadId })

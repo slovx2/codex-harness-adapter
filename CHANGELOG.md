@@ -5,6 +5,11 @@ The project is still private in `package.json`; this file tracks release notes
 for maintainers preparing the next public release and does not change package
 versioning or publishing metadata.
 
+## 0.4.3
+
+- Pi 被打断或失败的模型请求不再上报全零用量，桌面的上下文占用不会被清零；
+  `thread/resume` 回放最近一次请求的用量，重连或重新打开线程后上下文占用保持可见。
+
 ## 0.4.2
 
 - Pi 支持 `thread/archive` / `thread/unarchive`：归档只改变适配器侧列表状态，不改动 Pi 原生会话文件；

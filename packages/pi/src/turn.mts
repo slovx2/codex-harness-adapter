@@ -141,17 +141,18 @@ export function onEvent(server: PiServer, thread: PiThread, event: any): void {
           codexErrorInfo: null,
           additionalDetails: null,
         }
-      if (message.usage) {
-        const u = message.usage
-        const usage = {
-          totalTokens:
-            u.totalTokens ??
-            (u.input ?? 0) + (u.output ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0),
-          inputTokens: (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0),
-          cachedInputTokens: u.cacheRead ?? 0,
-          outputTokens: u.output ?? 0,
-          reasoningOutputTokens: 0,
-        }
+      const u = message.usage
+      const usage = u && {
+        totalTokens:
+          u.totalTokens ??
+          (u.input ?? 0) + (u.output ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0),
+        inputTokens: (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0),
+        cachedInputTokens: u.cacheRead ?? 0,
+        outputTokens: u.output ?? 0,
+        reasoningOutputTokens: 0,
+      }
+      // 被打断或失败的请求用量全为零；上报会把桌面的上下文占用清零。
+      if (usage && (usage.totalTokens || usage.inputTokens || usage.outputTokens)) {
         const previous = server.store.getMeta('usage', thread.id) ?? {
           totalTokens: 0,
           inputTokens: 0,
@@ -162,13 +163,16 @@ export function onEvent(server: PiServer, thread: PiThread, event: any): void {
         const total = Object.fromEntries(
           Object.entries(usage).map(([k, v]) => [k, (previous[k] ?? 0) + v]),
         )
+        const modelContextWindow = active.live?.session.model?.contextWindow ?? null
         server.store.setMeta('usage', thread.id, total)
+        // 恢复线程时回放最近一次请求的用量，见 restoreUsage。
+        server.store.setMeta('usage-last', thread.id, {
+          turnId: turn.id,
+          last: usage,
+          modelContextWindow,
+        })
         notify('thread/tokenUsage/updated', {
-          tokenUsage: {
-            total,
-            last: usage,
-            modelContextWindow: active.live?.session.model?.contextWindow ?? null,
-          },
+          tokenUsage: { total, last: usage, modelContextWindow },
         })
       }
     }

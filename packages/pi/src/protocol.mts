@@ -290,6 +290,7 @@ export async function dispatch(s: PiServer, peer: RpcPeer, method: string, p: an
       const thread = s.store.thread(p.threadId)
       s.subscribe(peer, thread.id)
       if (method === 'thread/resume' && !s.active.has(thread.id)) await s.load(thread, peer, true)
+      if (method === 'thread/resume') restoreUsage(s, peer, thread.id)
       return method === 'thread/resume'
         ? s.settings(thread)
         : { thread: s.envelope(thread, p.includeTurns !== false) }
@@ -493,6 +494,23 @@ export async function dispatch(s: PiServer, peer: RpcPeer, method: string, p: an
     default:
       throw new ProtocolError(-32601, `Pi 不支持 ${method}`)
   }
+}
+
+// 桌面重连或重新打开线程后不会保留用量，恢复时回放最近一次请求的上下文占用。
+function restoreUsage(s: PiServer, peer: RpcPeer, threadId: string): void {
+  const total = s.store.getMeta('usage', threadId)
+  const recent = s.store.getMeta('usage-last', threadId)
+  if (!total || !recent) return
+  setImmediate(() =>
+    peer.send({
+      method: 'thread/tokenUsage/updated',
+      params: {
+        threadId,
+        turnId: recent.turnId,
+        tokenUsage: { total, last: recent.last, modelContextWindow: recent.modelContextWindow },
+      },
+    }),
+  )
 }
 
 async function nativeMutation(s: PiServer, peer: RpcPeer, method: string, p: any): Promise<any> {

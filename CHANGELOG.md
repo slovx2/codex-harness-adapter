@@ -5,7 +5,7 @@ The project is still private in `package.json`; this file tracks release notes
 for maintainers preparing the next public release and does not change package
 versioning or publishing metadata.
 
-## 未发布
+## 0.5.0
 
 - Claude 的后台命令（`run_in_background` 的 Bash）跨回合存活：回合结束时还有后台命令在跑，Claude 进程就留下，
   后面的回合接着用同一个进程；桌面的后台终端列表、单个停止和全部清理在没有回合进行时也可用，

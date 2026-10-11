@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import {
   copyFileSync,
   existsSync,
@@ -48,9 +49,28 @@ import { goalToolServer, isGoalTool } from './goal-tools.mjs'
 import { hostClaudeExecutable } from './host-claude.mjs'
 import { jsonSchemaValidator } from './json-schema.mjs'
 import { sdkMcpStartupEnvironment } from './mcp-config.mjs'
-import { appendNativeContext, type ContextInjection } from './native-context.mjs'
+import {
+  appendNativeContext,
+  type ContextInjection,
+  persistedContextBoundary,
+} from './native-context.mjs'
 import { NativeMcpBridge } from './native-mcp-bridge.mjs'
 import { NativeProcess, succeedsWithin } from './native-process.mjs'
+import {
+  backgroundCommandEnd,
+  goalReminder,
+  isMainToolResult,
+  keepAliveLimit,
+  liveContext,
+  needsStrictSkillShell,
+  notificationFolded,
+  notificationGraceLeft,
+  resultConfirms,
+  sessionFingerprint,
+  startsRound,
+  steerMessage,
+  userMessage,
+} from './native-session.mjs'
 import { forkNativeSession } from './native-session-fork.mjs'
 import { NativeTurnInput } from './native-turn-input.mjs'
 import { mergePermissionOverlay, permissionToolName } from './permission-grants.mjs'
@@ -74,6 +94,7 @@ import type {
   PermissionDecision,
   RuntimeBackgroundShell,
   RuntimeHandlers,
+  RuntimeSessionHandlers,
   RuntimeTurnContext,
   UserInputAnswers,
   UserInputQuestion,
@@ -98,8 +119,52 @@ interface BackgroundShellState {
   nextSeq: number
 }
 
+// 一个 CLI 进程。回合结束时还有后台命令在跑，进程就留下来接着服务后面的回合；
+// 期间 CLI 自己开的一轮（后台命令结束后的续跑）由协议层另建回合接上。
+interface NativeSession {
+  // 会话所属线程；追问回合跑在父线程的会话上。
+  key: string
+  fingerprint: string
+  strictSkillShell: boolean
+  sessionId: string | null
+  // 当前回合的上下文；没有回合时是最近一个回合的。
+  context: RuntimeTurnContext
+  turn: PendingTurn | null
+  query: Query
+  input: NativeTurnInput
+  abort: AbortController
+  mcp: NativeMcpBridge
+  process: NativeProcess
+  shells: BackgroundShellState
+  // 出现在 background_tasks_changed 里的任务（任意类型）。它们结束后 CLI 会自己再跑一轮。
+  backgroundTasks: Set<string>
+  // CLI 上报的会话状态。idle 表示后台子代理及其通知触发的续跑都已结束；
+  // null 表示 CLI 没有上报过状态，回合仍在第一条 result 处结束。
+  state: 'idle' | 'running' | 'requires_action' | null
+  applied: {
+    model: string | null
+    effort: string | null
+    goalContext: string | null
+    planMode: boolean
+  }
+  // 后台任务的结束通知到达的时间：它触发的那一轮还没开始，也还看不出已被当前这一轮带走。
+  notificationAt: number | null
+  notificationTimer: ReturnType<typeof setTimeout> | null
+  reapTimer: ReturnType<typeof setTimeout> | null
+  // 正在等协议层把回合接上来。
+  attach: Promise<PendingTurn | null> | null
+  attachResolve: ((turn: PendingTurn | null) => void) | null
+  // 协议层没有接这一轮：丢弃它的输出，直到 CLI 回到 idle。
+  discard: boolean
+  kept: boolean
+  closing: boolean
+  closeReason: string
+  done: Promise<void>
+}
+
 interface PendingTurn {
   credentialScope: string | null
+  session: NativeSession
   context: RuntimeTurnContext
   handlers: RuntimeHandlers
   query: Query
@@ -108,6 +173,11 @@ interface PendingTurn {
   resolved: boolean
   resolve: () => void
   reject: (error: Error) => void
+  outcome: Promise<void>
+  settled: Promise<void>
+  // 本回合最后送入的用户消息；它被某条 result 确认之后回合才能结束。自行续跑的回合没有。
+  awaited: string | null
+  awaitedSeen: boolean
   // SDK assistant envelopes can deliver one content block at a time. Keep
   // dedup scoped to a model response, preserving unstreamed blocks alongside
   // streamed ones and emitting a boundary only when the message id changes.
@@ -137,9 +207,6 @@ interface PendingTurn {
   pendingUserMessage: null | { resolve: (v: { message: unknown }) => void }
   deferredResult: PendingTurnResult | null
   workflowFailure: string | null
-  // CLI 上报的会话状态。idle 表示后台子代理及其通知触发的续跑都已结束；
-  // null 表示本轮 CLI 没有上报过状态，回合仍在第一条 result 处结束。
-  sessionState: 'idle' | 'running' | 'requires_action' | null
   // 后台子代理：task_id（即 agentId）→ Agent 工具调用 ID，结果以 task_notification 为准。
   backgroundAgents: Map<string, string>
   // 各子代理最近一段正文，后台子代理结束时作为它的结果。
@@ -150,7 +217,6 @@ interface PendingTurnResult {
   success: boolean
   resultText: string | null
   claudeSessionId: string | null
-  inputReceipt: Record<string, unknown>
 }
 
 interface WorkflowTaskState {
@@ -170,45 +236,286 @@ interface PendingPermission {
 }
 
 const WORKFLOW_TERMINAL_FLUSH_TIMEOUT_MS = 500
+// 没有回合也没有后台命令的进程多留这么久再退出，避免刚停掉命令就来了新回合。
+const IDLE_REAP_MS = 2_000
+const SPONTANEOUS_ATTACH_TIMEOUT_MS = 10_000
 const WORKFLOW_JOURNAL_SETTLE_TIMEOUT_MS = 3_000
 
 export class NativeClaudeRuntime implements ClaudeRuntime {
   private sdk: ClaudeSdk | null = null
   private turns = new Map<string, PendingTurn>()
-  private backgroundShells = new Map<string, BackgroundShellState>()
+  private sessions = new Map<string, NativeSession>()
+  private sessionHandlers: RuntimeSessionHandlers | null = null
   private turnSettingsReady = new Map<
     string,
     { threadId: string; ready: Promise<PendingTurn | null> }
   >()
+  // 以下四张表按会话所属线程登记，覆盖进程从启动到确认退出的整个过程。
   private inputs = new Map<string, NativeTurnInput>()
   private permissions = new Map<string, PendingPermission>()
   private aborts = new Map<string, AbortController>()
   private cleanup = new Map<string, Promise<void>>()
   private processes = new Map<string, NativeProcess>()
+  // 追问回合的线程 → 它所用会话的线程，启动期间靠它找到进程。
+  private sessionKeys = new Map<string, string>()
+  // 正在等旧进程退出、还没起新进程的回合（按线程）；打断时置位。
+  private starting = new Map<string, { cancelled: boolean }>()
+
+  setSessionHandlers(handlers: RuntimeSessionHandlers): void {
+    this.sessionHandlers = handlers
+  }
+
+  liveSessions(): string[] {
+    return [...this.sessions.values()].filter((session) => !session.closing).map((s) => s.key)
+  }
+
+  async closeSession(threadId: string, reason: string): Promise<void> {
+    const session = this.sessions.get(threadId)
+    if (session) await this.shutdown(session, reason)
+  }
 
   async runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
-    const credentialScope = rateLimitCredentialScope(context.cwd)
-    if (this.processes.has(context.threadId))
+    const key = context.sessionThreadId ?? context.threadId
+    const existing = this.sessions.get(key)
+    if (context.spontaneous) {
+      // 那一轮已经被拒绝或超时放弃时，没有东西可接。
+      if (!existing || existing.closing || existing.turn || !existing.attach)
+        throw new ProtocolError(-32009, 'Claude CLI 已退出，自行续跑的回合无法接上')
+      return this.runOnSession(existing, context, handlers)
+    }
+    let restarted: string | null = null
+    let reason: string | null = null
+    if (existing && !existing.closing) {
+      if (existing.turn)
+        throw new ProtocolError(-32009, '上一个 Claude CLI 尚未确认退出，禁止启动新回合')
+      reason = this.incompatibility(existing, context)
+      if (!reason) return this.runOnSession(existing, context, handlers)
+      if (existing.shells.live.size > 0) restarted = reason
+    }
+    if (existing) {
+      // 等旧进程退出的这段时间里回合可能被打断：记一个标记，打断时置位。
+      const starting = { cancelled: false }
+      this.starting.set(context.threadId, starting)
+      try {
+        if (existing.closing) await succeedsWithin(existing.done, 5_000)
+        else await this.shutdown(existing, reason ?? '启动配置已改变')
+      } finally {
+        if (this.starting.get(context.threadId) === starting) this.starting.delete(context.threadId)
+      }
+      if (starting.cancelled) return
+    }
+    if (this.processes.has(key))
       throw new ProtocolError(-32009, '上一个 Claude CLI 尚未确认退出，禁止启动新回合')
-    let cleaned!: () => void
-    const cleanup = new Promise<void>((resolve) => {
-      cleaned = resolve
-    })
-    this.cleanup.set(context.threadId, cleanup)
-    const input = new NativeTurnInput(this.buildPromptIterable(context))
-    const abort = new AbortController()
-    const mcp = new NativeMcpBridge()
-    const nativeProcess = new NativeProcess(context.threadId, context.turnId)
-    this.processes.set(context.threadId, nativeProcess)
-    this.inputs.set(context.threadId, input)
-    this.aborts.set(context.threadId, abort)
-    let settingsReady!: (pending: PendingTurn | null) => void
+    if (restarted)
+      await handlers.onEvent({
+        type: 'notice',
+        level: 'warning',
+        message: `${restarted}，Claude 进程已重新启动，之前在后台运行的命令已停止。`,
+      })
+    return this.startSession(key, context, handlers)
+  }
+
+  // 新回合能否直接用现有进程；不能时返回要告诉用户的原因。
+  private incompatibility(session: NativeSession, context: RuntimeTurnContext): string | null {
+    // 压缩只是往会话里送一条命令，不依赖启动配置。
+    if (context.purpose === 'compact') return null
+    if (context.forkSession || (context.claudeSessionId ?? null) !== session.sessionId)
+      return '会话历史已改变'
+    if (sessionFingerprint(context) !== session.fingerprint) return '工作目录、工具或指令配置已改变'
+    if (needsStrictSkillShell(context) && !session.strictSkillShell) return '权限设置已收紧'
+    if ((!context.model && session.applied.model) || (!context.effort && session.applied.effort))
+      return '模型设置已改变'
+    return null
+  }
+
+  private beginTurnSettings(context: RuntimeTurnContext): (pending: PendingTurn | null) => void {
+    let ready!: (pending: PendingTurn | null) => void
     this.turnSettingsReady.set(context.turnId, {
       threadId: context.threadId,
       ready: new Promise((resolve) => {
-        settingsReady = resolve
+        ready = resolve
       }),
     })
+    return ready
+  }
+
+  private attachTurn(
+    session: NativeSession,
+    context: RuntimeTurnContext,
+    handlers: RuntimeHandlers,
+  ): PendingTurn {
+    let resolve!: () => void
+    let reject!: (error: Error) => void
+    const outcome = new Promise<void>((done, fail) => {
+      resolve = done
+      reject = fail
+    })
+    const pending: PendingTurn = {
+      credentialScope: rateLimitCredentialScope(context.cwd),
+      session,
+      context,
+      handlers,
+      query: session.query,
+      abort: session.abort,
+      input: session.input,
+      resolved: false,
+      resolve,
+      reject,
+      outcome,
+      settled: outcome.catch(() => {}),
+      awaited: null,
+      awaitedSeen: false,
+      assistantMessageId: null,
+      usageMessageIds: new Map(),
+      usageByMessage: new Map(),
+      streamedBlocks: new Map(),
+      activeSubagents: new Set(),
+      completedWorkflowTasks: new Set(),
+      workflowToolUseIds: new Set(),
+      workflowLaunches: new Map(),
+      workflowTranscriptRoots: defaultWorkflowTranscriptRoots(process.env, context.cwd),
+      skippedWorkflowTaskIds: new Set(),
+      workflowTasks: new Map(),
+      toolStartSeen: new Set(),
+      structuredBuffer: '',
+      pendingUserMessage: null,
+      deferredResult: null,
+      workflowFailure: null,
+      backgroundAgents: new Map(),
+      subagentText: new Map(),
+    }
+    this.turns.set(context.turnId, pending)
+    session.context = context
+    session.turn = pending
+    session.attachResolve?.(pending)
+    return pending
+  }
+
+  // 在已有进程上跑一个回合：用户回合送入一条消息；自行续跑的回合接到已经在跑的那一轮上。
+  private async runOnSession(
+    session: NativeSession,
+    context: RuntimeTurnContext,
+    handlers: RuntimeHandlers,
+  ): Promise<void> {
+    this.clearTimer(session, 'reapTimer')
+    const ready = this.beginTurnSettings(context)
+    try {
+      const pending = this.attachTurn(session, context, handlers)
+      // 用户消息送进去之前到达的 result（比如正好赶上的后台命令通知那一轮）不属于这个回合：
+      // 接上时就记下要等的消息 ID。
+      const uuid = context.spontaneous ? null : randomUUID()
+      pending.awaited = uuid
+      try {
+        // 压缩用的是一套临时配置，不改会话已经生效的模型与模式。
+        if (context.purpose !== 'compact') await this.applyTurnConfig(session, context)
+        if (uuid && !pending.resolved) {
+          const reminder =
+            context.purpose === 'compact'
+              ? null
+              : goalReminder(session.applied.goalContext, context.goalContext ?? null)
+          if (context.purpose !== 'compact')
+            session.applied.goalContext = context.goalContext ?? null
+          session.input.send(userMessage(context, uuid, reminder))
+        }
+        // 首条用户消息送入之后才放行回合内追加的指令，保证先后。
+        ready(pending)
+      } catch (error) {
+        // 进程在应用设置时出了问题：整个进程不再可信，连同后台命令一起结束。
+        if (!pending.resolved) {
+          void this.shutdown(session, '应用回合设置失败')
+          throw error
+        }
+      }
+      await pending.outcome
+    } finally {
+      ready(null)
+      this.turnSettingsReady.delete(context.turnId)
+      if (session.closing) await session.done
+    }
+  }
+
+  // 模型、推理强度、计划模式都有运行期接口；其余启动配置由 incompatibility 把关。
+  private async applyTurnConfig(
+    session: NativeSession,
+    context: RuntimeTurnContext,
+  ): Promise<void> {
+    const settings: RuntimeTurnSettings = {}
+    if (context.model && context.model !== session.applied.model) settings.model = context.model
+    if (context.effort && context.effort !== session.applied.effort)
+      settings.effortLevel = context.effort as NonNullable<RuntimeTurnSettings['effortLevel']>
+    if (Object.keys(settings).length > 0) {
+      await session.query.applyFlagSettings(settings)
+      if (settings.model) session.applied.model = settings.model
+      if (settings.effortLevel) session.applied.effort = settings.effortLevel
+    }
+    if (context.planMode !== session.applied.planMode) {
+      await session.query.setPermissionMode(derivePermissionMode(context.planMode))
+      session.applied.planMode = context.planMode
+    }
+  }
+
+  private clearTimer(session: NativeSession, name: 'reapTimer' | 'notificationTimer'): void {
+    const timer = session[name]
+    if (timer) clearTimeout(timer)
+    session[name] = null
+  }
+
+  // 结束一个进程：让 CLI 自己停掉后台命令并退出，等它确认。
+  private async shutdown(session: NativeSession, reason: string): Promise<void> {
+    if (!session.closeReason) session.closeReason = reason
+    session.closing = true
+    this.clearTimer(session, 'reapTimer')
+    this.clearTimer(session, 'notificationTimer')
+    session.attachResolve?.(null)
+    session.input.close()
+    try {
+      await session.process.terminate()
+    } catch (error) {
+      debugLog('native.session.terminateFailed', { threadId: session.key, error: String(error) })
+    }
+    session.abort.abort()
+    await session.done
+  }
+
+  // 没有回合也没有后台命令的进程不再有用。
+  private scheduleReap(session: NativeSession): void {
+    if (session.reapTimer || session.closing) return
+    session.reapTimer = setTimeout(() => {
+      session.reapTimer = null
+      if (session.closing || session.turn || session.attach || session.shells.live.size > 0) return
+      void this.shutdown(session, '后台命令已全部结束')
+    }, IDLE_REAP_MS)
+    session.reapTimer.unref()
+  }
+
+  // 起一个新的 CLI 进程并在上面跑第一个回合。
+  private async startSession(
+    key: string,
+    context: RuntimeTurnContext,
+    handlers: RuntimeHandlers,
+  ): Promise<void> {
+    let cleaned!: () => void
+    const done = new Promise<void>((resolve) => {
+      cleaned = resolve
+    })
+    this.cleanup.set(key, done)
+    const input = new NativeTurnInput()
+    const abort = new AbortController()
+    const mcp = new NativeMcpBridge()
+    const nativeProcess = new NativeProcess(key, context.turnId)
+    this.processes.set(key, nativeProcess)
+    this.inputs.set(key, input)
+    this.aborts.set(key, abort)
+    if (key !== context.threadId) this.sessionKeys.set(context.threadId, key)
+    const ready = this.beginTurnSettings(context)
+    const slot: { context: RuntimeTurnContext; session: NativeSession | null } = {
+      context,
+      session: null,
+    }
+    const current = (): Promise<PendingTurn | null> =>
+      slot.session ? this.currentTurn(slot.session) : Promise.resolve(null)
+    let session: NativeSession | null = null
+    let pending: PendingTurn
     try {
       if (
         context.permissionTools &&
@@ -219,167 +526,169 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         throw new Error('codex_harness_adapter_permissions 是内部权限服务保留名称')
       const sdk = await this.loadSdk()
       if (input.isClosed) throw new ProtocolError(-32009, '原生回合启动已取消')
-      const options = this.buildOptions(sdk, context, abort)
+      const live = liveContext({
+        get context() {
+          return slot.session?.context ?? slot.context
+        },
+      })
+      const liveHandlers = this.liveHandlers(current)
+      const options = this.buildOptions(sdk, live, abort, current)
       options.spawnClaudeCodeProcess = nativeProcess.spawn.bind(nativeProcess)
       options.mcpServers = await mcp.connect(
         context.mcpServers,
         context.cwd,
-        handlers,
+        liveHandlers,
         abort.signal,
         context.mcpConfigSource,
       )
       if (input.isClosed) throw new ProtocolError(-32009, '原生回合启动已取消')
-      return await new Promise<void>((resolve, reject) => {
-        // The SDK accepts either a plain string prompt OR an AsyncIterable of
-        // SDKUserMessage envelopes. Always feed the iterable form so we have
-        // room to attach image blocks alongside the text and the door is open
-        // for mid-turn steer() calls.
-        if (context.dynamicTools?.length || context.goalTools || context.permissionTools) {
-          const nativeIds = new Map<string, string[]>()
-          const hooks = options.hooks as { PreToolUse: Array<{ hooks: unknown[] }> }
-          hooks.PreToolUse.push({
-            hooks: [
-              async (input: Record<string, unknown>, toolUseId: string) => {
-                const key = `${input.tool_name}:${submissionHash(input.tool_input)}`
-                const ids = nativeIds.get(key) ?? []
-                ids.push(toolUseId)
-                nativeIds.set(key, ids)
-                return {}
-              },
-            ],
-          })
-          const servers = (options.mcpServers as Record<string, unknown>) ?? {}
-          if (context.dynamicTools?.length)
-            servers.codex_harness_adapter = dynamicToolServer(
-              context.dynamicTools,
-              handlers,
-              (name, args) => {
-                const id = nativeIds
-                  .get(`mcp__codex_harness_adapter__${name}:${submissionHash(args)}`)
-                  ?.shift()
-                if (!id) throw new Error('缺少原生工具调用 ID，禁止执行副作用')
-                return id
-              },
-            )
-          if (context.goalTools) {
-            if (servers.codex_harness_adapter_goal)
-              throw new Error('codex_harness_adapter_goal 是内部目标服务保留名称')
-            servers.codex_harness_adapter_goal = goalToolServer(
-              {
-                ...handlers,
-                onGoalToolCall: async (name, args, callId) => {
-                  const result = await handlers.onGoalToolCall?.(name, args, callId)
-                  if (name === 'create_goal') context.trackGoalTools = true
-                  return result
-                },
-              },
-              (name, args) => {
-                const id = nativeIds
-                  .get(`mcp__codex_harness_adapter_goal__${name}:${submissionHash(args)}`)
-                  ?.shift()
-                if (!id) throw new Error('缺少原生目标工具调用 ID，禁止执行')
-                return id
-              },
-            )
-          }
-          if (context.permissionTools) {
-            servers.codex_harness_adapter_permissions = permissionToolServer(
-              async (proposal, callId) => {
-                abort.signal.throwIfAborted()
-                if (context.planMode)
-                  throw new Error('计划模式不能申请新增执行权限；请先确认退出计划')
-                if (!allowsApproval(context.approvalPolicy, 'request_permissions'))
-                  throw new Error('当前审批策略禁止申请新增权限')
-                if (!handlers.onPermissionToolCall) throw new Error('权限执行端不可用')
-                const grant = await handlers.onPermissionToolCall(proposal, callId)
-                abort.signal.throwIfAborted()
-                if (context.planMode) throw new Error('计划模式禁止应用执行授权')
-                context.permissionGrants = mergePermissionOverlay(context.permissionGrants, grant)
-                return grant
-              },
-              (args) => {
-                const id = nativeIds.get(`${permissionToolName}:${submissionHash(args)}`)?.shift()
-                if (!id) throw new Error('缺少原生权限工具调用 ID，禁止申请授权')
-                return id
-              },
-            )
-          }
-          options.mcpServers = servers
-        }
-
-        const query = sdk.query({ prompt: input, options })
-        const pending: PendingTurn = {
-          credentialScope,
-          context,
-          handlers,
-          query,
-          abort,
-          input,
-          resolved: false,
-          resolve,
-          reject,
-          assistantMessageId: null,
-          usageMessageIds: new Map(),
-          usageByMessage: new Map(),
-          streamedBlocks: new Map(),
-          activeSubagents: new Set(),
-          completedWorkflowTasks: new Set(),
-          workflowToolUseIds: new Set(),
-          workflowLaunches: new Map(),
-          workflowTranscriptRoots: defaultWorkflowTranscriptRoots(process.env, context.cwd),
-          skippedWorkflowTaskIds: new Set(),
-          workflowTasks: new Map(),
-          toolStartSeen: new Set(),
-          structuredBuffer: '',
-          pendingUserMessage: null,
-          deferredResult: null,
-          workflowFailure: null,
-          sessionState: null,
-          backgroundAgents: new Map(),
-          subagentText: new Map(),
-        }
-        this.turns.set(context.turnId, pending)
-        settingsReady(pending)
-        // Kick off the receive loop in the background. We don't await it here
-        // because runTurn() must resolve when the result message arrives — the
-        // receive loop will call resolve/reject on `pending` once the SDK ends.
-        void this.consume(pending).catch((err: unknown) => {
-          if (!pending.resolved) {
-            pending.resolved = true
-            this.turns.delete(context.turnId)
-            reject(err instanceof Error ? err : new Error(String(err)))
-          }
-        })
-      })
-    } finally {
-      settingsReady(null)
+      this.addInternalServers(options, live, liveHandlers, abort)
+      const query = sdk.query({ prompt: input, options })
+      session = {
+        key,
+        fingerprint: sessionFingerprint(context),
+        strictSkillShell: needsStrictSkillShell(context),
+        sessionId: null,
+        context,
+        turn: null,
+        query,
+        input,
+        abort,
+        mcp,
+        process: nativeProcess,
+        shells: {
+          live: new Map(),
+          taskToolUse: new Map(),
+          bashCommand: new Map(),
+          seqByTask: new Map(),
+          nextSeq: 0,
+        },
+        backgroundTasks: new Set(),
+        state: null,
+        applied: {
+          model: context.model,
+          effort: context.effort,
+          goalContext: context.goalContext ?? null,
+          planMode: context.planMode,
+        },
+        notificationAt: null,
+        notificationTimer: null,
+        reapTimer: null,
+        attach: null,
+        attachResolve: null,
+        discard: false,
+        kept: false,
+        closing: false,
+        closeReason: '',
+        done,
+      }
+      slot.session = session
+      this.sessions.set(key, session)
+      pending = this.attachTurn(session, context, handlers)
+      ready(pending)
+      // The SDK accepts either a plain string prompt OR an AsyncIterable of
+      // SDKUserMessage envelopes. Always feed the iterable form so we have
+      // room to attach image blocks alongside the text and the door is open
+      // for mid-turn steer() calls.
+      input.send(userMessage(context, null, null))
+    } catch (error) {
+      // 进程没有进入消息循环，这里按同样的顺序收尾。
+      ready(null)
       this.turnSettingsReady.delete(context.turnId)
-      input.close()
-      if (this.inputs.get(context.threadId) === input) this.inputs.delete(context.threadId)
-      if (this.aborts.get(context.threadId) === abort) this.aborts.delete(context.threadId)
-      let stopped = false
+      this.sessionKeys.delete(context.threadId)
+      if (session && this.sessions.get(key) === session) this.sessions.delete(key)
       try {
-        try {
-          await nativeProcess.stopIfUnconfirmed()
-          await mcp.close()
-        } finally {
-          if (!(await nativeProcess.wait(3_000))) await nativeProcess.terminate()
-          stopped = true
-        }
+        await this.releaseProcess(key, input, abort, mcp, nativeProcess, () => {})
       } finally {
-        if (stopped && this.processes.get(context.threadId) === nativeProcess) {
-          this.processes.delete(context.threadId)
-          // 后台 shell 随本轮 CLI 进程结束。
-          this.backgroundShells.delete(context.threadId)
-        }
-        if (this.cleanup.get(context.threadId) === cleanup) this.cleanup.delete(context.threadId)
+        if (this.cleanup.get(key) === done) this.cleanup.delete(key)
         cleaned()
       }
+      throw error
+    }
+    // Kick off the receive loop in the background. We don't await it here
+    // because runTurn() must resolve when the turn ends — the receive loop
+    // settles each turn and keeps serving the process afterwards.
+    void this.runSession(session, cleaned)
+    try {
+      await pending.outcome
+    } finally {
+      ready(null)
+      this.turnSettingsReady.delete(context.turnId)
+      this.sessionKeys.delete(context.threadId)
+      if (session.closing) await session.done
+    }
+  }
+
+  // 消息循环结束即进程生命周期结束：结清挂着的回合，确认进程退出，释放执行屏障。
+  private async runSession(session: NativeSession, cleaned: () => void): Promise<void> {
+    try {
+      await this.consume(session)
+    } catch (error) {
+      // 收尾本身出错也不能把回合和进程登记留在那里。
+      debugLog('native.session.consumeFailed', { threadId: session.key, error: String(error) })
+      const pending = session.turn
+      if (pending && !pending.resolved) {
+        this.detach(pending)
+        pending.reject(error instanceof Error ? error : new Error(String(error)))
+      }
+    }
+    session.closing = true
+    this.clearTimer(session, 'reapTimer')
+    this.clearTimer(session, 'notificationTimer')
+    session.attachResolve?.(null)
+    const reason = session.closeReason || 'Claude 进程已退出'
+    try {
+      await this.releaseProcess(
+        session.key,
+        session.input,
+        session.abort,
+        session.mcp,
+        session.process,
+        () => {},
+      )
+    } finally {
+      if (this.sessions.get(session.key) === session) this.sessions.delete(session.key)
+      if (this.cleanup.get(session.key) === session.done) this.cleanup.delete(session.key)
+      try {
+        this.sessionHandlers?.onSessionClosed(session.key, reason)
+      } catch (error) {
+        debugLog('native.session.closedHandlerFailed', {
+          threadId: session.key,
+          error: String(error),
+        })
+      }
+      cleaned()
+    }
+  }
+
+  private async releaseProcess(
+    key: string,
+    input: NativeTurnInput,
+    abort: AbortController,
+    mcp: NativeMcpBridge,
+    nativeProcess: NativeProcess,
+    cleaned: () => void,
+  ): Promise<void> {
+    input.close()
+    if (this.inputs.get(key) === input) this.inputs.delete(key)
+    if (this.aborts.get(key) === abort) this.aborts.delete(key)
+    let stopped = false
+    try {
+      try {
+        await nativeProcess.stopIfUnconfirmed()
+        await mcp.close()
+      } finally {
+        if (!(await nativeProcess.wait(3_000))) await nativeProcess.terminate()
+        stopped = true
+      }
+    } finally {
+      if (stopped && this.processes.get(key) === nativeProcess) this.processes.delete(key)
+      cleaned()
     }
   }
 
   listBackgroundShells(threadId: string): RuntimeBackgroundShell[] {
-    const state = this.backgroundShells.get(threadId)
+    const state = this.sessions.get(threadId)?.shells
     if (!state) return []
     return [...state.live]
       .map(([taskId, seq]) => {
@@ -394,14 +703,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       .sort((a, b) => a.seq - b.seq)
   }
 
+  // 有没有回合在跑都能停：后台命令属于进程，不属于某个回合。
   async stopBackgroundShell(threadId: string, taskId: string): Promise<boolean> {
-    if (!this.backgroundShells.get(threadId)?.live.has(taskId)) return false
-    const pending = [...this.turns.values()].find(
-      (turn) => turn.context.threadId === threadId && !turn.resolved,
-    )
-    if (!pending) return false
+    const session = this.sessions.get(threadId)
+    if (!session || session.closing || !session.shells.live.has(taskId)) return false
     try {
-      await pending.query.stopTask(taskId)
+      await session.query.stopTask(taskId)
       return true
     } catch (error) {
       debugLog('native.backgroundShell.stopFailed', { threadId, taskId, error: String(error) })
@@ -409,28 +716,105 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
   }
 
-  private backgroundShellState(threadId: string): BackgroundShellState {
-    let state = this.backgroundShells.get(threadId)
-    if (!state) {
-      state = {
-        live: new Map(),
-        taskToolUse: new Map(),
-        bashCommand: new Map(),
-        seqByTask: new Map(),
-        nextSeq: 0,
+  // 线程当前的进程：它自己的，或者（追问回合）它借用的父线程的。
+  private sessionFor(threadId: string): NativeSession | null {
+    const own = this.sessions.get(threadId)
+    if (own) return own
+    for (const session of this.sessions.values())
+      if (session.turn?.context.threadId === threadId) return session
+    return null
+  }
+
+  // 回调（权限、钩子、内置工具）到来时所属的回合。没有回合说明 CLI 自己开了一轮，
+  // 请协议层接上；接不上返回 null，调用方按“回合已结束”拒绝。
+  private currentTurn(session: NativeSession): Promise<PendingTurn | null> {
+    if (session.turn) return Promise.resolve(session.turn)
+    if (session.closing || session.discard) return Promise.resolve(null)
+    if (session.attach) return session.attach
+    let timer: ReturnType<typeof setTimeout> | undefined
+    session.attach = new Promise<PendingTurn | null>((resolve) => {
+      session.attachResolve = (turn) => {
+        clearTimeout(timer)
+        session.attach = null
+        session.attachResolve = null
+        resolve(turn)
       }
-      this.backgroundShells.set(threadId, state)
+    })
+    const attach = session.attach
+    const refuse = (): void => {
+      if (session.attach === attach) this.abandonRound(session)
     }
-    return state
+    timer = setTimeout(refuse, SPONTANEOUS_ATTACH_TIMEOUT_MS)
+    timer.unref()
+    if (!this.sessionHandlers) refuse()
+    else
+      void this.sessionHandlers.onSpontaneousTurn(session.key).then((accepted) => {
+        if (!accepted) refuse()
+      }, refuse)
+    return attach
+  }
+
+  // 放弃 CLI 自己开的、没有回合来接的那一轮：中止它，丢掉它剩下的输出。
+  private abandonRound(session: NativeSession): void {
+    if (!session.attachResolve) return
+    session.discard = true
+    session.attachResolve(null)
+    void session.query.interrupt().catch(() => {})
+    // 等人接的时候回收被跳过了，这里补上。
+    this.scheduleReap(session)
+  }
+
+  private liveHandlers(current: () => Promise<PendingTurn | null>): RuntimeHandlers {
+    const turn = async (): Promise<RuntimeHandlers> => {
+      const pending = await current()
+      if (!pending) throw new Error('回合已结束，不能执行')
+      return pending.handlers
+    }
+    return {
+      onEvent: async (event) => {
+        await (await current())?.handlers.onEvent(event)
+      },
+      onPermissionRequest: async (event) => (await turn()).onPermissionRequest(event),
+      onPermissionToolCall: async (proposal, callId) => {
+        const handlers = await turn()
+        if (!handlers.onPermissionToolCall) throw new Error('权限执行端不可用')
+        return handlers.onPermissionToolCall(proposal, callId)
+      },
+      onGoalToolCall: async (name, args, callId) => {
+        const handlers = await turn()
+        if (!handlers.onGoalToolCall) throw new Error('目标执行端不可用')
+        return handlers.onGoalToolCall(name, args, callId)
+      },
+      onDynamicToolCall: async (tool, args, callId) => {
+        const handlers = await turn()
+        if (!handlers.onDynamicToolCall) throw new Error('工具未注册或执行端不可用')
+        return handlers.onDynamicToolCall(tool, args, callId)
+      },
+      onElicitationRequest: async (request, signal) => {
+        const handlers = await turn()
+        if (!handlers.onElicitationRequest) throw new Error('MCP 交互处理器未注册')
+        return handlers.onElicitationRequest(request, signal)
+      },
+    }
   }
 
   async steer(threadId: string, prompt: string): Promise<void> {
-    const input = this.inputs.get(threadId)
-    if (!input) throw new ProtocolError(-32009, '原生回合未启动或已结束')
-    input.steer(workflowRuntimePrompt(prompt))
+    // 进程还在启动，或回合正在应用设置：等首条用户消息送入之后再送，保证先后。
+    const starting = [...this.turnSettingsReady.values()].find(
+      (entry) => entry.threadId === threadId,
+    )
+    const pending = starting ? await starting.ready : (this.sessionFor(threadId)?.turn ?? null)
+    if (!pending || pending.resolved || pending.context.threadId !== threadId)
+      throw new ProtocolError(-32009, '原生回合未启动或已结束')
+    const uuid = randomUUID()
+    pending.input.send(steerMessage(workflowRuntimePrompt(prompt), uuid))
+    pending.awaited = uuid
+    pending.awaitedSeen = false
   }
 
   async appendContext(context: ContextInjection): Promise<{ boundary: string }> {
+    const session = this.sessions.get(context.threadId)
+    if (session && !session.closing) return this.appendToSession(session, context)
     if (this.processes.has(context.threadId))
       throw new ProtocolError(-32009, 'Claude CLI 尚未退出，不能追加上下文')
     let cleaned!: () => void
@@ -460,6 +844,36 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
   }
 
+  // 进程还活着：直接送一条不触发模型请求的用户消息，不另起进程抢同一个会话文件。
+  private async appendToSession(
+    session: NativeSession,
+    context: ContextInjection,
+  ): Promise<{ boundary: string }> {
+    if (session.turn || session.attach)
+      throw new ProtocolError(-32009, 'Claude CLI 正在运行，不能追加上下文')
+    if (context.sessionId !== session.sessionId)
+      throw new ProtocolError(-32000, '原生会话与存活的 Claude 进程不一致，不能追加上下文')
+    const sdk = await this.loadSdk()
+    const persisted = await persistedContextBoundary(sdk, context)
+    if (persisted) return { boundary: persisted }
+    session.input.send({
+      type: 'user',
+      uuid: context.messageId as `${string}-${string}-${string}-${string}-${string}`,
+      message: { role: 'user', content: context.content },
+      parent_tool_use_id: null,
+      shouldQuery: false,
+      client_composed: true,
+    })
+    const deadline = Date.now() + 5_000
+    while (Date.now() < deadline) {
+      const boundary = await persistedContextBoundary(sdk, context)
+      if (boundary) return { boundary }
+      if (session.closing) break
+      await delay(50)
+    }
+    throw new ProtocolError(-32000, '原生历史未持久化注入 UUID，不能返回成功')
+  }
+
   async updateTurnSettings(
     threadId: string,
     turnId: string,
@@ -469,8 +883,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (!startup || startup.threadId !== threadId) return false
     const pending = await startup.ready
     if (!pending || pending.resolved || pending.abort.signal.aborted) return false
-    // CLI的flag层只属于当前进程；不写settings文件或未来回合的线程设置。
-    if (Object.keys(settings).length) await pending.query.applyFlagSettings(settings)
+    // CLI 的 flag 层只属于当前进程，不写 settings 文件。进程可能留到后面的回合，
+    // 所以记下已生效的值，下个回合按线程设置重新对齐。
+    if (Object.keys(settings).length) {
+      await pending.query.applyFlagSettings(settings)
+      if (settings.model) pending.session.applied.model = settings.model
+      if (settings.effortLevel) pending.session.applied.effort = settings.effortLevel
+    }
     return true
   }
 
@@ -484,27 +903,83 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   }
 
   async interrupt(threadId: string): Promise<void> {
-    const cleanup = this.cleanup.get(threadId)
-    const pending = [...this.turns.values()].find((turn) => turn.context.threadId === threadId)
+    // 回合还在等旧进程退出：让它不要再起新进程。
+    const starting = this.starting.get(threadId)
+    if (starting) starting.cancelled = true
+    const session = this.sessionFor(threadId)
+    if (!session) {
+      // 进程还在启动，或者只是一次上下文追加。
+      const key = this.sessionKeys.get(threadId) ?? threadId
+      const cleanup = this.cleanup.get(key)
+      const nativeProcess = this.processes.get(key)
+      this.inputs.get(key)?.close()
+      this.aborts.get(key)?.abort()
+      if (nativeProcess && !(await nativeProcess.wait(2_500))) await nativeProcess.terminate()
+      await cleanup
+      if (this.processes.get(key) === nativeProcess) this.processes.delete(key)
+      return
+    }
+    const pending = session.turn
+    if (!pending) {
+      // CLI 自己开的那一轮还没有回合接上：协议层的回合已经被打断，这一轮不再要了。
+      // 其余情况下留着的进程只是在看管后台命令，打断与它无关。
+      if (session.attach && !session.closing) this.abandonRound(session)
+      return
+    }
+    // 还有后台命令在跑时只中止这一轮，进程和命令都留下。
+    if (!session.closing && session.shells.live.size > 0 && keepAliveLimit() > 0) {
+      if (await this.interruptRound(pending)) {
+        await this.stopWorkflowTasks(pending)
+        if ((await succeedsWithin(pending.settled, 2_500)) && !session.closing) return
+      }
+    }
+    await this.interruptAndClose(session)
+  }
+
+  // 只中止当前这一轮。停止意味着全部停下：排着队还没处理的追加指令一并取消，
+  // 否则它们会在打断之后自己跑起来。取消不掉（旧版 CLI 不认这个选项）时返回 false，
+  // 由调用方改为结束进程。
+  private async interruptRound(pending: PendingTurn): Promise<boolean> {
+    const interrupt = pending.query.interrupt.bind(pending.query) as (options?: {
+      cancelQueued?: boolean
+    }) => Promise<{ still_queued?: string[] } | undefined>
+    let receipt: { still_queued?: string[] } | undefined
+    const done = interrupt({ cancelQueued: true }).then((value) => {
+      receipt = value
+    })
+    if (!(await succeedsWithin(done, 1_500))) return false
+    return !receipt?.still_queued?.length
+  }
+
+  private async interruptAndClose(session: NativeSession): Promise<void> {
+    const pending = session.turn
+    const nativeProcess = session.process
+    if (!session.closeReason) session.closeReason = '回合已中断'
+    session.closing = true
     // SDK 的 abort 先关闭 stdin，CLI 仍有退出宽限期；此时释放 MCP
     // 会把错误工具结果送回尚未中断的模型循环。先等待 CLI 确认中断。
-    const nativeProcess = this.processes.get(threadId)
     if (pending) {
-      if (await succeedsWithin(pending.query.interrupt(), 1_500))
-        nativeProcess?.allowGracefulClose()
-      else await nativeProcess?.terminate()
+      if (await succeedsWithin(pending.query.interrupt(), 1_500)) nativeProcess.allowGracefulClose()
+      else await nativeProcess.terminate()
     }
-    this.inputs.get(threadId)?.close()
-    this.aborts.get(threadId)?.abort()
+    session.input.close()
+    session.abort.abort()
     if (pending) await this.stopWorkflowTasks(pending)
-    if (nativeProcess && !(await nativeProcess.wait(2_500))) await nativeProcess.terminate()
-    await cleanup
-    if (this.processes.get(threadId) === nativeProcess) this.processes.delete(threadId)
+    if (!(await nativeProcess.wait(2_500))) await nativeProcess.terminate()
+    await session.done
   }
 
   async stop(): Promise<void> {
-    const threads = new Set([...this.cleanup.keys(), ...this.processes.keys()])
-    await Promise.all([...threads].map((threadId) => this.interrupt(threadId)))
+    const sessions = [...this.sessions.values()]
+    const others = [...new Set([...this.cleanup.keys(), ...this.processes.keys()])].filter(
+      (key) => !this.sessions.has(key),
+    )
+    await Promise.all([
+      ...sessions.map((session) =>
+        session.turn ? this.interruptAndClose(session) : this.shutdown(session, '适配器已停止'),
+      ),
+      ...others.map((key) => this.interrupt(key)),
+    ])
     this.turns.clear()
     this.permissions.clear()
   }
@@ -555,50 +1030,93 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     return this.sdk
   }
 
-  private buildPromptIterable(context: RuntimeTurnContext): AsyncIterable<any> {
-    const text = workflowRuntimePrompt(context.prompt)
-    const images = context.imageInputs
-    return (async function* () {
-      if (!images || images.length === 0) {
-        // Pure text — keep the simple string form so the SDK doesn't have to
-        // re-stitch content blocks.
-        yield {
-          type: 'user' as const,
-          message: { role: 'user' as const, content: text },
-          parent_tool_use_id: null,
-          origin: { kind: 'human' as const },
-        }
-        return
-      }
-      // Multimodal — assemble the Anthropic MessageParam content array.
-      const content: unknown[] = []
-      if (text) content.push({ type: 'text', text })
-      for (const img of images) {
-        if (img.kind === 'base64') {
-          content.push({
-            type: 'image',
-            source: { type: 'base64', media_type: img.mediaType, data: img.data },
-          })
-        } else {
-          content.push({
-            type: 'image',
-            source: { type: 'url', url: img.data },
-          })
-        }
-      }
-      yield {
-        type: 'user' as const,
-        message: { role: 'user' as const, content },
-        parent_tool_use_id: null,
-        origin: { kind: 'human' as const },
-      }
-    })()
+  // 适配器自己的工具服务（动态工具、目标、权限申请）。它们在进程启动时注册，
+  // 处理器与上下文都取“当前回合”的。
+  private addInternalServers(
+    options: Record<string, unknown>,
+    context: RuntimeTurnContext,
+    handlers: RuntimeHandlers,
+    abort: AbortController,
+  ): void {
+    if (!context.dynamicTools?.length && !context.goalTools && !context.permissionTools) return
+    const nativeIds = new Map<string, string[]>()
+    const hooks = options.hooks as { PreToolUse: Array<{ hooks: unknown[] }> }
+    hooks.PreToolUse.push({
+      hooks: [
+        async (input: Record<string, unknown>, toolUseId: string) => {
+          const key = `${input.tool_name}:${submissionHash(input.tool_input)}`
+          const ids = nativeIds.get(key) ?? []
+          ids.push(toolUseId)
+          nativeIds.set(key, ids)
+          return {}
+        },
+      ],
+    })
+    const servers = (options.mcpServers as Record<string, unknown>) ?? {}
+    if (context.dynamicTools?.length)
+      servers.codex_harness_adapter = dynamicToolServer(
+        context.dynamicTools,
+        handlers,
+        (name, args) => {
+          const id = nativeIds
+            .get(`mcp__codex_harness_adapter__${name}:${submissionHash(args)}`)
+            ?.shift()
+          if (!id) throw new Error('缺少原生工具调用 ID，禁止执行副作用')
+          return id
+        },
+      )
+    if (context.goalTools) {
+      if (servers.codex_harness_adapter_goal)
+        throw new Error('codex_harness_adapter_goal 是内部目标服务保留名称')
+      servers.codex_harness_adapter_goal = goalToolServer(
+        {
+          ...handlers,
+          onGoalToolCall: async (name, args, callId) => {
+            const result = await handlers.onGoalToolCall?.(name, args, callId)
+            if (name === 'create_goal') context.trackGoalTools = true
+            return result
+          },
+        },
+        (name, args) => {
+          const id = nativeIds
+            .get(`mcp__codex_harness_adapter_goal__${name}:${submissionHash(args)}`)
+            ?.shift()
+          if (!id) throw new Error('缺少原生目标工具调用 ID，禁止执行')
+          return id
+        },
+      )
+    }
+    if (context.permissionTools) {
+      servers.codex_harness_adapter_permissions = permissionToolServer(
+        async (proposal, callId) => {
+          abort.signal.throwIfAborted()
+          if (context.planMode) throw new Error('计划模式不能申请新增执行权限；请先确认退出计划')
+          if (!allowsApproval(context.approvalPolicy, 'request_permissions'))
+            throw new Error('当前审批策略禁止申请新增权限')
+          if (!handlers.onPermissionToolCall) throw new Error('权限执行端不可用')
+          const grant = await handlers.onPermissionToolCall(proposal, callId)
+          abort.signal.throwIfAborted()
+          if (context.planMode) throw new Error('计划模式禁止应用执行授权')
+          context.permissionGrants = mergePermissionOverlay(context.permissionGrants, grant)
+          return grant
+        },
+        (args) => {
+          const id = nativeIds.get(`${permissionToolName}:${submissionHash(args)}`)?.shift()
+          if (!id) throw new Error('缺少原生权限工具调用 ID，禁止申请授权')
+          return id
+        },
+      )
+    }
+    options.mcpServers = servers
   }
 
+  // context 是“当前回合”的视图：进程启动时取一次的项用的是第一个回合的值，
+  // 回调里读到的则是调用时那个回合的值。
   private buildOptions(
     sdk: ClaudeSdk,
     context: RuntimeTurnContext,
     abort: AbortController,
+    current: () => Promise<PendingTurn | null>,
   ): Record<string, unknown> {
     const originalBashInputs: OriginalBashInputs = new Map()
     const reservedGoalTools = new Set<string>()
@@ -627,17 +1145,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       settings: {
         plansDirectory: relative(context.cwd, planDirectory(context)),
         // Skill 的内联 shell 不经过 Bash hook；受限会话只能通过常规工具执行命令。
-        ...(context.planMode ||
-        context.sandboxMode !== 'danger-full-access' ||
-        context.approvalPolicy !== 'never'
-          ? { disableSkillShellExecution: true }
-          : {}),
+        ...(needsStrictSkillShell(context) ? { disableSkillShellExecution: true } : {}),
         ...(context.skillOverrides ? { skillOverrides: context.skillOverrides } : {}),
       },
       disallowedTools: ['CronCreate', 'CronDelete', 'CronList', 'ScheduleWakeup'],
       stderr: (data: string) => process.stderr.write(data),
       onElicitation: (async (request, { signal }) => {
-        const pending = this.turns.get(context.turnId)
+        const pending = await current()
         if (signal.aborted || !pending?.handlers.onElicitationRequest) return { action: 'cancel' }
         try {
           return await pending.handlers.onElicitationRequest(request, signal)
@@ -687,7 +1201,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
                 )
               })
               if (entry) {
-                const pending = this.turns.get(context.turnId)
+                const pending = await current()
                 const assistant = entry.message as Record<string, unknown>
                 if (pending && context.goalTools) await this.goalUsage(pending, assistant)
                 if (pending && context.trackGoalTools && !isGoalTool(String(event.tool_name))) {
@@ -716,33 +1230,33 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       ],
     })
 
-    const relay = context.subagentRelay
-    if (relay)
-      permissionHooks.PreToolUse.push({
-        hooks: [
-          async (event: Record<string, unknown>) => {
-            // 被恢复的子代理自己的工具调用照常走权限流程。
-            if (typeof event.agent_id === 'string') return {}
-            if (event.tool_name !== 'SendMessage')
-              return {
-                hookSpecificOutput: {
-                  hookEventName: 'PreToolUse',
-                  permissionDecision: 'deny',
-                  permissionDecisionReason:
-                    '本回合只负责把用户的话转给子代理：请调用 SendMessage，不要调用其他工具。',
-                },
-              }
-            // 收件人与正文由适配器写定，模型的转述不会改动用户原文。
+    // 追问回合可能跑在已经存活的进程上，所以这个钩子始终注册，调用时再看是不是追问回合。
+    permissionHooks.PreToolUse.push({
+      hooks: [
+        async (event: Record<string, unknown>) => {
+          const relay = context.subagentRelay
+          // 被恢复的子代理自己的工具调用照常走权限流程。
+          if (!relay || typeof event.agent_id === 'string') return {}
+          if (event.tool_name !== 'SendMessage')
             return {
               hookSpecificOutput: {
                 hookEventName: 'PreToolUse',
-                permissionDecision: 'allow',
-                updatedInput: { to: relay.agentId, message: relay.message },
+                permissionDecision: 'deny',
+                permissionDecisionReason:
+                  '本回合只负责把用户的话转给子代理：请调用 SendMessage，不要调用其他工具。',
               },
             }
-          },
-        ],
-      })
+          // 收件人与正文由适配器写定，模型的转述不会改动用户原文。
+          return {
+            hookSpecificOutput: {
+              hookEventName: 'PreToolUse',
+              permissionDecision: 'allow',
+              updatedInput: { to: relay.agentId, message: relay.message },
+            },
+          }
+        },
+      ],
+    })
 
     if (parseWorkflowCommand(context.prompt)?.type === 'run') {
       opts.settings = {
@@ -752,19 +1266,14 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       }
     }
 
-    // 即使完全访问也保留提问与计划确认；只对明确的完全访问组合自动授权。
-    opts.canUseTool = this.makeCanUseTool(
-      context,
-      context.approvalPolicy === 'never' && context.sandboxMode === 'danger-full-access',
-      originalBashInputs,
-    )
+    opts.canUseTool = this.makeCanUseTool(context, originalBashInputs, current)
     const hooks = opts.hooks as Record<string, unknown>
     hooks.PostToolUse = [
       {
         matcher: 'EnterPlanMode|ExitPlanMode|Write|Edit',
         hooks: [
           async (event: Record<string, unknown>) => {
-            const pending = this.turns.get(context.turnId)
+            const pending = await current()
             if (!pending || pending.abort.signal.aborted || event.agent_id) return {}
             const input = (event.tool_input ?? {}) as Record<string, unknown>
             if (isPlanFile(context, String(event.tool_name), input)) {
@@ -778,6 +1287,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
             const enabled = event.tool_name === 'EnterPlanMode'
             await pending.query.setPermissionMode(derivePermissionMode(enabled))
             context.planMode = enabled
+            if (pending.session) pending.session.applied.planMode = enabled
             await pending.handlers.onEvent({ type: 'plan_mode', enabled })
             return {}
           },
@@ -786,7 +1296,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     ]
     const confirmNativeTool =
       (failed: boolean) => async (event: Record<string, unknown>, callId: string) => {
-        const pending = this.turns.get(context.turnId)
+        const pending = await current()
         if (pending && reservedGoalTools.delete(callId) && !isGoalTool(String(event.tool_name)))
           pending.handlers.onNativeToolResult?.(callId, { confirmed: true, failed })
         return {}
@@ -813,8 +1323,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 
   private makeCanUseTool(
     context: RuntimeTurnContext,
-    autoAllow: boolean,
-    originalBashInputs: OriginalBashInputs = new Map(),
+    originalBashInputs: OriginalBashInputs,
+    current: () => Promise<PendingTurn | null>,
   ) {
     return async (
       toolName: string,
@@ -830,8 +1340,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       | { behavior: 'deny'; message: string; interrupt?: boolean }
     > => {
       const toolUseId = options.toolUseID || `tool-${newId()}`
-      const pending = this.turns.get(context.turnId)
+      const pending = await current()
       if (!pending) return { behavior: 'deny', message: 'turn already finished' }
+      // 即使完全访问也保留提问与计划确认；只对明确的完全访问组合自动授权。
+      const autoAllow =
+        context.approvalPolicy === 'never' && context.sandboxMode === 'danger-full-access'
       if (context.permissionTools && toolName === permissionToolName)
         return options.agentID
           ? { behavior: 'deny', message: '子代理不能申请父会话权限' }
@@ -975,21 +1488,39 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
   }
 
-  private async consume(pending: PendingTurn): Promise<void> {
-    const { context, handlers, query } = pending
+  private async consume(session: NativeSession): Promise<void> {
     try {
-      for await (const message of query as AsyncIterable<Record<string, unknown>>) {
+      for await (const message of session.query as AsyncIterable<Record<string, unknown>>) {
+        this.observe(session, message)
+        if (session.discard) {
+          // 被放弃的那一轮：丢到它的 result 为止。这期间可能已有新回合接上，
+          // 那一轮被中止的 result 不能算到新回合头上。
+          if (message.type === 'result') session.discard = false
+          continue
+        }
+        let pending = session.turn
+        if (!pending) {
+          // 没有回合时到来的内容：要么是 CLI 自己开的一轮，要么可以忽略。
+          if (!startsRound(message)) continue
+          pending = await this.currentTurn(session)
+          if (!pending) continue
+        }
         if (
           (message.type === 'assistant' || message.type === 'user') &&
           !message.parent_tool_use_id &&
           typeof message.uuid === 'string'
         ) {
-          await handlers.onEvent({ type: 'native_boundary', messageId: message.uuid })
+          await pending.handlers.onEvent({ type: 'native_boundary', messageId: message.uuid })
         }
         await this.handleMessage(pending, message)
-        if (pending.resolved) break
+        // 回合结束而进程不保留时，消息循环到此为止；保留则继续服务后面的回合。
+        if (pending.resolved && session.closing) break
       }
-      if (!pending.resolved && pending.deferredResult) {
+      // 迭代器结束即进程已经或即将退出。先标记，再结清挂着的回合。
+      session.closing = true
+      const pending = session.turn
+      if (!pending || pending.resolved) return
+      if (pending.deferredResult) {
         // The SDK iterator is the authoritative lifetime of a turn. If it
         // closes while a workflow journal still has an unresolved task, there
         // will be no later task_notification to unblock the deferred result.
@@ -1004,10 +1535,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       // a SDKResultMessage when interrupted cleanly).
       if (!pending.resolved) {
         await this.stopWorkflowTasks(pending)
-        pending.resolved = true
-        this.turns.delete(context.turnId)
+        this.detach(pending)
         try {
-          await handlers.onEvent({
+          await pending.handlers.onEvent({
             type: 'completed',
             success: false,
             result: 'SDK 未返回终态，执行结果不确定，请读取历史对账',
@@ -1018,16 +1548,117 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         }
       }
     } catch (err) {
-      if (!pending.resolved) {
-        await this.stopWorkflowTasks(pending)
-        pending.resolved = true
-        this.turns.delete(context.turnId)
-        const error = err instanceof Error ? err : new Error(String(err))
-        try {
-          await handlers.onEvent({ type: 'error', message: error.message })
-        } catch {}
-        pending.reject(error)
+      session.closing = true
+      const pending = session.turn
+      if (!pending || pending.resolved) {
+        debugLog('native.session.failed', { threadId: session.key, error: String(err) })
+        return
       }
+      this.detach(pending)
+      const error = err instanceof Error ? err : new Error(String(err))
+      try {
+        await this.stopWorkflowTasks(pending)
+        await pending.handlers.onEvent({ type: 'error', message: error.message })
+      } catch {}
+      pending.reject(error)
+    }
+  }
+
+  // 把回合从进程上摘下来；进程是否留下由调用方决定。
+  private detach(pending: PendingTurn): void {
+    pending.resolved = true
+    this.turns.delete(pending.context.turnId)
+    if (pending.session?.turn === pending) pending.session.turn = null
+  }
+
+  // 属于进程而不属于某个回合的状态：后台任务、会话状态、会话 ID。没有回合时也要跟。
+  private observe(session: NativeSession, message: Record<string, unknown>): void {
+    if (
+      session.notificationAt != null &&
+      isMainToolResult(message) &&
+      notificationFolded(session.notificationAt, Date.now())
+    )
+      session.notificationAt = null
+    if (message.type !== 'system') return
+    const subtype = String(message.subtype ?? '')
+    if (
+      subtype === 'session_state_changed' ||
+      subtype === 'background_tasks_changed' ||
+      subtype === 'command_lifecycle' ||
+      subtype.startsWith('task_')
+    )
+      debugLog('native.sdk.system', {
+        threadId: session.key,
+        turnId: session.turn?.context.turnId ?? null,
+        subtype,
+        state: message.state,
+        taskId: message.task_id,
+        taskType: message.task_type,
+        status: message.status,
+      })
+    if (subtype === 'init') {
+      if (typeof message.session_id === 'string' && message.session_id)
+        session.sessionId = message.session_id
+      // 哪些工具在真实环境里可用（如 Monitor）只有这里看得到。
+      debugLog('native.sdk.init', { threadId: session.key, tools: message.tools })
+      // 新的一轮开始了：之前的结束通知由这一轮处理。
+      session.notificationAt = null
+      this.clearTimer(session, 'notificationTimer')
+      return
+    }
+    if (subtype === 'session_state_changed') {
+      const state = message.state
+      if (state !== 'idle' && state !== 'running' && state !== 'requires_action') return
+      session.state = state
+      if (state === 'idle') session.discard = false
+      return
+    }
+    if (subtype === 'background_tasks_changed' && Array.isArray(message.tasks)) {
+      const state = session.shells
+      const live = new Map<string, number>()
+      for (const task of message.tasks as Array<Record<string, unknown>>) {
+        if (typeof task.task_id !== 'string' || !task.task_id) continue
+        session.backgroundTasks.add(task.task_id)
+        if (task.task_type !== 'local_bash' || task.ambient === true) continue
+        let seq = state.seqByTask.get(task.task_id)
+        if (seq == null) {
+          seq = state.nextSeq++
+          state.seqByTask.set(task.task_id, seq)
+        }
+        live.set(task.task_id, seq)
+      }
+      state.live = live
+      session.process.trackBackgroundProcesses()
+      if (live.size === 0 && !session.turn) this.scheduleReap(session)
+      return
+    }
+    if (
+      subtype === 'task_started' &&
+      message.task_type === 'local_bash' &&
+      typeof message.task_id === 'string' &&
+      typeof message.tool_use_id === 'string'
+    ) {
+      session.shells.taskToolUse.set(message.task_id, message.tool_use_id)
+      session.process.trackBackgroundProcesses()
+      return
+    }
+    if (subtype !== 'task_notification' || typeof message.task_id !== 'string') return
+    if (!session.backgroundTasks.delete(message.task_id)) return
+    const stopped = message.status === 'killed' || message.status === 'stopped'
+    // 任务自己结束后 CLI 会再跑一轮把结果告诉模型；被停掉的不会。
+    if (!stopped) session.notificationAt = Date.now()
+    if (!session.shells.seqByTask.has(message.task_id)) return
+    const toolUseId = session.shells.taskToolUse.get(message.task_id) ?? null
+    try {
+      this.sessionHandlers?.onBackgroundCommandEnded(
+        session.key,
+        backgroundCommandEnd(message, toolUseId),
+      )
+    } catch (error) {
+      debugLog('native.session.commandEndedHandlerFailed', {
+        threadId: session.key,
+        error: String(error),
+      })
     }
   }
 
@@ -1066,37 +1697,15 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     message: Record<string, unknown>,
   ): Promise<void> {
     const subtype = String(message.subtype ?? '')
-    if (subtype === 'background_tasks_changed' && Array.isArray(message.tasks)) {
-      const state = this.backgroundShellState(pending.context.threadId)
-      const live = new Map<string, number>()
-      for (const task of message.tasks as Array<Record<string, unknown>>) {
-        if (task.task_type !== 'local_bash' || task.ambient === true) continue
-        if (typeof task.task_id !== 'string' || !task.task_id) continue
-        let seq = state.seqByTask.get(task.task_id)
-        if (seq == null) {
-          seq = state.nextSeq++
-          state.seqByTask.set(task.task_id, seq)
-        }
-        live.set(task.task_id, seq)
-      }
-      state.live = live
+    if (subtype === 'background_tasks_changed') return
+    if (subtype === 'command_lifecycle') {
+      // 用户消息对应的那一轮跑完了；有些命令（如压缩）的 result 不带消息 ID。
+      if (message.state === 'completed' && message.command_uuid === pending.awaited)
+        pending.awaitedSeen = true
       return
     }
-    if (
-      subtype === 'task_started' &&
-      message.task_type === 'local_bash' &&
-      typeof message.task_id === 'string' &&
-      typeof message.tool_use_id === 'string'
-    )
-      this.backgroundShellState(pending.context.threadId).taskToolUse.set(
-        message.task_id,
-        message.tool_use_id,
-      )
     if (subtype === 'session_state_changed') {
-      const state = message.state
-      if (state !== 'idle' && state !== 'running' && state !== 'requires_action') return
-      pending.sessionState = state
-      if (state === 'idle') await this.finishDeferredResult(pending)
+      if (message.state === 'idle') await this.finishDeferredResult(pending)
       return
     }
     if (subtype === 'task_notification' && typeof message.task_id === 'string') {
@@ -1494,10 +2103,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         const input = (block.input as Record<string, unknown>) || {}
         if (!id) continue
         if (name === 'Bash')
-          this.backgroundShellState(pending.context.threadId).bashCommand.set(
-            id,
-            String(input.command ?? ''),
-          )
+          pending.session?.shells.bashCommand.set(id, String(input.command ?? ''))
         // Suppress nested tool uses while a subagent is in flight.
         const parentSubagent = nestedMessage || pending.activeSubagents.size > 0
         if (isSubagentTool(name)) {
@@ -1575,6 +2181,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         })
         continue
       }
+      const backgroundTaskId = isError
+        ? null
+        : this.backgroundTaskFor(pending, toolUseId, structured)
       // Even if this was a subagent we still emit its tool_result so the
       // server's subagent state machine closes the collabAgentToolCall.
       await pending.handlers.onEvent({
@@ -1583,6 +2192,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         content: bodyContent,
         isError,
         ...(structured === undefined ? {} : { structured }),
+        ...(backgroundTaskId ? { backgroundTaskId } : {}),
       })
       if (!workflowLaunchAttached && isWorkflowLaunch && toolResultCount === 1) {
         workflowLaunchAttached = true
@@ -1590,6 +2200,21 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       }
       void wasSubagent
     }
+  }
+
+  // 这条工具结果是不是后台命令的启动回执。以结构化结果为准；一条消息带多个结果时
+  // 没有结构化结果，退回到任务启动时记下的对应关系。
+  private backgroundTaskFor(
+    pending: PendingTurn,
+    toolUseId: string,
+    structured: unknown,
+  ): string | null {
+    const shells = pending.session?.shells
+    if (!shells?.bashCommand.has(toolUseId)) return null
+    const reported = (structured as { backgroundTaskId?: unknown } | undefined)?.backgroundTaskId
+    if (typeof reported === 'string' && reported) return reported
+    for (const [taskId, owner] of shells.taskToolUse) if (owner === toolUseId) return taskId
+    return null
   }
 
   private attachWorkflowJournal(pending: PendingTurn, value: unknown, toolUseId: string): void {
@@ -1904,27 +2529,31 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   private async finishDeferredResult(pending: PendingTurn, force = false): Promise<void> {
     const deferred = pending.deferredResult
     if (!deferred || pending.resolved) return
-    if (force && deferred.success && !pending.input.consumedBy(deferred.inputReceipt)) {
+    const session = pending.session as NativeSession | undefined
+    const confirmed = !pending.awaited || pending.awaitedSeen
+    if (force && deferred.success && !confirmed) {
       deferred.success = false
       deferred.resultText = 'SDK 退出前未确认追加指令，执行结果不确定，请读取历史对账'
     }
-    if (!force && deferred.success && !pending.input.consumedBy(deferred.inputReceipt)) return
+    if (!force && deferred.success && !confirmed) return
     if (!force && deferred.success && this.hasPendingWorkflowTasks(pending)) return
     // 后台子代理结束后 CLI 会自行续跑一轮并再发一条 result；idle 之前回合都没有结束。
-    if (
-      !force &&
-      deferred.success &&
-      pending.sessionState != null &&
-      pending.sessionState !== 'idle'
-    )
-      return
+    if (!force && deferred.success && session?.state != null && session.state !== 'idle') return
+    // 结束通知与 idle 几乎同时到达时，通知触发的那一轮还没开始；等它开始再结束回合。
+    if (!force && deferred.success && session && this.awaitsNotificationRound(session)) return
 
     pending.deferredResult = null
-    pending.resolved = true
-    this.processes.get(pending.context.threadId)?.allowGracefulClose()
-    pending.input.close()
-    this.turns.delete(pending.context.turnId)
+    this.detach(pending)
+    const refusal = session && !force ? this.keepAlive(session) : null
+    if (session && (force || refusal !== null)) {
+      // 进程不保留：让 CLI 自己收尾退出，runTurn 等它确认后才返回。
+      session.closing = true
+      session.process.allowGracefulClose()
+      session.input.close()
+    }
     try {
+      if (refusal)
+        await pending.handlers.onEvent({ type: 'notice', level: 'warning', message: refusal })
       await pending.handlers.onEvent({
         type: 'completed',
         success: deferred.success,
@@ -1941,12 +2570,67 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
   }
 
+  // 回合结束时进程要不要留下。返回 null 表示留下；空串表示不留；
+  // 其他文字表示本该留下却留不了，要告诉用户后台命令为什么停了。
+  private keepAlive(session: NativeSession): string | null {
+    if (session.closing || session.process.hasExited) return ''
+    if (session.shells.live.size === 0) return ''
+    const limit = keepAliveLimit()
+    if (limit <= 0) return ''
+    if (session.kept) return null
+    const kept = [...this.sessions.values()].filter((other) => other.kept && !other.closing).length
+    if (kept >= limit)
+      return `已有 ${kept} 个会话在保留后台命令，达到上限；本回合启动的后台命令已随回合结束而停止。`
+    session.kept = true
+    return null
+  }
+
+  // 还要不要为结束通知触发的那一轮等下去。要等时到点再来结算一次；等待期间又来了通知就接着等。
+  private awaitsNotificationRound(session: NativeSession): boolean {
+    if (session.notificationAt == null) return false
+    const left = notificationGraceLeft(session.notificationAt, Date.now())
+    if (left === 0) {
+      session.notificationAt = null
+      return false
+    }
+    if (session.notificationTimer) return true
+    session.notificationTimer = setTimeout(() => {
+      session.notificationTimer = null
+      const pending = session.turn
+      if (pending)
+        void this.finishDeferredResult(pending).catch((error) =>
+          debugLog('native.session.finishFailed', { threadId: session.key, error: String(error) }),
+        )
+    }, left)
+    session.notificationTimer.unref()
+    return true
+  }
+
   private async handleResult(
     pending: PendingTurn,
     message: Record<string, unknown>,
   ): Promise<void> {
+    debugLog('native.sdk.result', {
+      threadId: pending.context?.threadId,
+      turnId: pending.context?.turnId,
+      origin: message.origin,
+      numTurns: message.num_turns,
+    })
     if (pending.resolved) return
+    if (pending.awaited && resultConfirms(message, pending.awaited)) pending.awaitedSeen = true
     const subtype = String(message.subtype ?? '')
+    // 多个后台任务同时结束时 CLI 会先发一条空 result，真正的那条随后才到；
+    // 适配器送入的静默消息也只产生空 result。它们不能盖掉已有的结果。
+    if (
+      pending.deferredResult &&
+      subtype === 'success' &&
+      !message.is_error &&
+      Number(message.num_turns) === 0 &&
+      !message.result
+    ) {
+      await this.finishDeferredResult(pending)
+      return
+    }
     let success = subtype === 'success' && !message.is_error && pending.workflowFailure == null
     let resultText =
       pending.workflowFailure ?? (message.result == null ? null : String(message.result))
@@ -1982,7 +2666,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // SDK 的格式工具通过 result.structured_output 返回数据，不能丢弃后用输入合成答案。
     if (success && structuredText)
       await pending.handlers.onEvent({ type: 'text_delta', delta: structuredText })
-    pending.deferredResult = { success, resultText, claudeSessionId, inputReceipt: message }
+    pending.deferredResult = { success, resultText, claudeSessionId }
     if (!success) await this.stopWorkflowTasks(pending)
     await this.finishDeferredResult(pending)
   }

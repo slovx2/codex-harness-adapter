@@ -169,7 +169,7 @@ async function main(): Promise<void> {
   }
   const onClose = (peer: RpcPeer) => {
     activePeers = Math.max(0, activePeers - 1)
-    server.closePeer(peer)
+    server.closePeer(peer, isStdio)
     if (isStdio) {
       // A stdio peer is the process lifetime. If Codex closes its pipe during
       // reconnect, stop the runtime and terminalize all child turns before the

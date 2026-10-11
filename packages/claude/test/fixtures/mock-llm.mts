@@ -19,6 +19,8 @@ export type ModelStep = (
 export class MockLLM {
   readonly requests: ModelRequest[] = []
   readonly unexpected: string[] = []
+  // 计划之外的请求由它应答。只用于时机不由测试控制的请求，例如后台命令结束后 CLI 自行续跑。
+  fallback: ModelStep | null = null
   private steps: ModelStep[] = []
   private reclaimed: (() => void) | undefined
   private closing: Promise<void> | undefined
@@ -44,7 +46,7 @@ export class MockLLM {
         return
       }
       this.requests.push(body)
-      const step = this.steps.shift()
+      const step = this.steps.shift() ?? this.fallback
       if (!step) throw new Error('收到未计划的模型请求')
       const reply = await step(body, req.headers)
       if (!Array.isArray(reply) && !('content' in reply)) {

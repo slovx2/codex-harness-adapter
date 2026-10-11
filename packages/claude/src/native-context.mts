@@ -100,25 +100,31 @@ export function parseContextItems(items: unknown): ContextBlock[] {
   return content
 }
 
+// 注入的消息是否已经写进原生历史；已写入时返回当前历史的末尾边界。
+export async function persistedContextBoundary(
+  sdk: typeof import('@anthropic-ai/claude-agent-sdk'),
+  context: ContextInjection,
+): Promise<string | null> {
+  const messages = await sdk.getSessionMessages(context.sessionId, { dir: context.cwd })
+  const message = messages.find((entry) => entry.uuid === context.messageId)
+  if (!message) return null
+  const payload = message.message as Record<string, unknown>
+  if (
+    message.type !== 'user' ||
+    payload.role !== 'user' ||
+    !isDeepStrictEqual(payload.content, context.content)
+  )
+    throw new ProtocolError(-32000, '原生注入 UUID 的持久内容不一致，禁止重放')
+  return messages.at(-1)?.uuid ?? null
+}
+
 export async function appendNativeContext(
   sdk: typeof import('@anthropic-ai/claude-agent-sdk'),
   context: ContextInjection,
   abort: AbortController,
   nativeProcess: NativeProcess,
 ): Promise<{ boundary: string }> {
-  const inspect = async (): Promise<string | null> => {
-    const messages = await sdk.getSessionMessages(context.sessionId, { dir: context.cwd })
-    const message = messages.find((entry) => entry.uuid === context.messageId)
-    if (!message) return null
-    const payload = message.message as Record<string, unknown>
-    if (
-      message.type !== 'user' ||
-      payload.role !== 'user' ||
-      !isDeepStrictEqual(payload.content, context.content)
-    )
-      throw new ProtocolError(-32000, '原生注入 UUID 的持久内容不一致，禁止重放')
-    return messages.at(-1)?.uuid ?? null
-  }
+  const inspect = (): Promise<string | null> => persistedContextBoundary(sdk, context)
   const persisted = await inspect()
   abort.signal.throwIfAborted()
   if (persisted) return { boundary: persisted }

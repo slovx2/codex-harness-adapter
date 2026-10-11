@@ -23,6 +23,7 @@ import {
   sanitizeAgentapiTerminalContent,
 } from '../src/http-agent-runtime.mjs'
 import { NativeClaudeRuntime, sdkResumeSessionId } from '../src/native-runtime.mjs'
+import { userMessage } from '../src/native-session.mjs'
 import { NativeTurnInput } from '../src/native-turn-input.mjs'
 import { resolveRuntimeConfig } from '../src/runtime-config.mjs'
 import { planDirectory } from '../src/runtime-permissions.mjs'
@@ -114,9 +115,7 @@ test('native SDK runtime maps manual /workflows prompts to the human workflow tr
     approvalPolicy: 'never',
     sandboxMode: 'danger-full-access',
   })
-  const buildPromptIterable = Reflect.get(runtime, 'buildPromptIterable')
-  const messages: any[] = []
-  for await (const message of buildPromptIterable.call(runtime, context)) messages.push(message)
+  const messages: any[] = [userMessage(context, null, null)]
 
   assert.equal(
     messages[0].message.content,
@@ -129,7 +128,10 @@ test('native SDK runtime maps manual /workflows prompts to the human workflow tr
   assert.deepEqual(messages[0].origin, { kind: 'human' })
 
   const buildOptions = Reflect.get(runtime, 'buildOptions')
-  const options = buildOptions.call(runtime, {}, context, new AbortController())
+  // 权限回调按“当前回合”取处理器。
+  const options = buildOptions.call(runtime, {}, context, new AbortController(), async () => ({
+    handlers: {},
+  }))
   assert.deepEqual(options.settings, {
     plansDirectory: relative(context.cwd, planDirectory(context)),
     enableWorkflows: true,
@@ -138,23 +140,17 @@ test('native SDK runtime maps manual /workflows prompts to the human workflow tr
   assert.equal(options.permissionMode, 'default')
   assert.equal(options.allowDangerouslySkipPermissions, undefined)
   assert.equal(typeof options.canUseTool, 'function')
-  const turns = Reflect.get(runtime, 'turns') as Map<string, unknown>
-  turns.set(context.turnId, { handlers: {} })
-  try {
-    assert.deepEqual(
-      await options.canUseTool(
-        'Bash',
-        { command: 'true' },
-        {
-          toolUseID: 'tool',
-          signal: new AbortController().signal,
-        },
-      ),
-      { behavior: 'allow', updatedInput: { command: 'true' } },
-    )
-  } finally {
-    turns.delete(context.turnId)
-  }
+  assert.deepEqual(
+    await options.canUseTool(
+      'Bash',
+      { command: 'true' },
+      {
+        toolUseID: 'tool',
+        signal: new AbortController().signal,
+      },
+    ),
+    { behavior: 'allow', updatedInput: { command: 'true' } },
+  )
 })
 
 test('环境变量不能绕过会话权限', () => {
@@ -214,8 +210,6 @@ test('workflow transcript roots follow CLAUDE_CONFIG_DIR and HOME deterministica
 })
 
 test('manual workflow normalization preserves attached image blocks', async () => {
-  const runtime = new NativeClaudeRuntime()
-  const buildPromptIterable = Reflect.get(runtime, 'buildPromptIterable')
   const context = nativeTurnContext({
     prompt: '/workflows inspect this image',
     imageInputs: [
@@ -227,8 +221,7 @@ test('manual workflow normalization preserves attached image blocks', async () =
       },
     ],
   })
-  const messages: any[] = []
-  for await (const message of buildPromptIterable.call(runtime, context)) messages.push(message)
+  const messages: any[] = [userMessage(context, null, null)]
   assert.match(messages[0].message.content[0].text, /^ultracode: inspect this image/)
   assert.deepEqual(messages[0].message.content[1], {
     type: 'image',
@@ -528,7 +521,7 @@ test('native SDK parent result does not cap workflow runtime at three seconds', 
   let resolved = false
   const pending = {
     context: nativeTurnContext({ turnId: 'parent-result-workflow-turn' }),
-    input: new NativeTurnInput((async function* () {})()),
+    input: new NativeTurnInput(),
     activeSubagents: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['parent-result-workflow-launch']),
@@ -1865,32 +1858,30 @@ test('workflow journal monitor does not commit started bookkeeping after stop', 
 
 test('native SDK permission allow result carries original input for SDK validation', async () => {
   const runtime = new NativeClaudeRuntime()
-  const turns = Reflect.get(runtime, 'turns')
-  assert.ok(turns instanceof Map)
   const input = { command: 'printf ok' }
   const requests: unknown[] = []
-  turns.set('turn', {
+  const pending = {
     handlers: {
       onPermissionRequest: async (event: unknown) => {
         requests.push(event)
         return { decision: 'accept' }
       },
     },
-  })
-
-  try {
-    const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
-    assert.equal(typeof makeCanUseTool, 'function')
-    const canUseTool = makeCanUseTool.call(runtime, { threadId: 'thread', turnId: 'turn' }, false)
-    const result = await canUseTool('Bash', input, {
-      toolUseID: 'tool',
-      signal: new AbortController().signal,
-    })
-    assert.deepEqual(result, { behavior: 'allow', updatedInput: input })
-    assert.equal(requests.length, 1)
-  } finally {
-    turns.delete('turn')
   }
+  const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
+  assert.equal(typeof makeCanUseTool, 'function')
+  const canUseTool = makeCanUseTool.call(
+    runtime,
+    { threadId: 'thread', turnId: 'turn' },
+    new Map(),
+    async () => pending,
+  )
+  const result = await canUseTool('Bash', input, {
+    toolUseID: 'tool',
+    signal: new AbortController().signal,
+  })
+  assert.deepEqual(result, { behavior: 'allow', updatedInput: input })
+  assert.equal(requests.length, 1)
 })
 
 test('HTTP agent runtime streams agentapi-compatible message updates', async () => {

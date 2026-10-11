@@ -1,3 +1,4 @@
+import { realpathSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
 
 // 真实 CLI 用例只用运行测试的人通过 CHA_CLAUDE_CLI 显式指定的隔离 CLI。
@@ -7,6 +8,17 @@ export const missingClaudeCli = '/nonexistent/set-CHA_CLAUDE_CLI-to-an-isolated-
 
 export function configuredClaudeCli(): string {
   return process.env.CHA_CLAUDE_CLI?.trim() || missingClaudeCli
+}
+
+// 进程表里 CLI 进程的命令行开头。适配器启动的是解析符号链接之后的路径
+// （npm 装出来的 `.bin/claude` 是指向包内二进制的链接），按配置的原路径找不到进程。
+export function claudeCliCommand(): string {
+  const cli = configuredClaudeCli()
+  try {
+    return realpathSync(cli)
+  } catch {
+    return cli
+  }
 }
 
 export function requiredClaudeCli(): string {

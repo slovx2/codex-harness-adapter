@@ -4,7 +4,9 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import { claudeCliCommand } from './fixtures/claude-cli.mjs'
 import { MockLLM, type ModelRequest } from './fixtures/mock-llm.mjs'
+import { descendants, killAll } from './fixtures/process-tree.mjs'
 import { ProtocolClient } from './fixtures/protocol-client.mjs'
 
 const toolId = () => `toolu_${randomUUID().replace(/-/g, '').slice(0, 20)}`
@@ -383,6 +385,90 @@ test('SUBAGENT-004：在子线程追问会带着子代理原有上下文继续',
   } finally {
     await client.close()
     await model.close()
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+  }
+})
+
+test('SUBAGENT-010：父线程留着后台命令时在子线程追问，复用父线程的进程', {
+  timeout: 120_000,
+}, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'native-subagent-live-'))
+  await writeFile(join(home, 'a.txt'), 'probe-file-content: 42\n')
+  const model = new MockLLM()
+  const client = await ProtocolClient.start(home, await model.start())
+  const command = `sleep 60.${String(process.hrtime.bigint()).slice(-6)}`
+  const cliPids = (): number[] =>
+    descendants(client.process.pid as number)
+      .filter((row) => row.command.startsWith(claudeCliCommand()))
+      .map((row) => row.pid)
+  const commandAlive = (): boolean =>
+    descendants(client.process.pid as number).some((row) => row.command === command)
+  try {
+    const { thread } = await client.request('thread/start', {
+      cwd: home,
+      sandbox: 'danger-full-access',
+      approvalPolicy: 'never',
+    })
+    for (let index = 0; index < 4; index++) model.enqueue(subagentRouter(home, 'foreground'))
+    const first = await client.request('turn/start', {
+      threadId: thread.id,
+      input: [{ type: 'text', text: 'SUBAGENT_MAIN 请派子代理读取 a.txt' }],
+    })
+    assert.equal((await client.completed(first.turn.id)).status, 'completed')
+    const [child] = await childThreads(client, thread.id)
+    assert.ok(child, '应创建子线程')
+    await client.request('thread/resume', { threadId: child.id })
+
+    // 父线程起一条后台命令，回合结束后进程留下。
+    model.enqueue(() => [
+      {
+        type: 'tool_use',
+        id: toolId(),
+        name: 'Bash',
+        input: { command, run_in_background: true, description: 'background' },
+      },
+    ])
+    model.enqueue(() => [{ type: 'text', text: 'MAIN_BACKGROUND_STARTED' }])
+    const second = await client.request('turn/start', {
+      threadId: thread.id,
+      input: [{ type: 'text', text: '在后台启动一条长命令' }],
+    })
+    assert.equal((await client.completed(second.turn.id)).status, 'completed')
+    const live = cliPids()
+    assert.equal(live.length, 1, '父线程的进程应留下')
+    assert.equal(commandAlive(), true)
+
+    enqueueFollowUp(model, home, 'parent-first')
+    const followUp = await client.request('turn/start', {
+      threadId: child.id,
+      input: [{ type: 'text', text: 'CHILD_FOLLOWUP 刚才读到的数值是多少' }],
+    })
+    await assertCompleted(client, model, followUp.turn.id)
+    model.assertConsumed()
+    assert.deepEqual(cliPids(), live, '追问没有另起进程')
+    assert.equal(commandAlive(), true, '父线程的后台命令不受追问影响')
+    const after = (await client.request('thread/read', { threadId: child.id, includeTurns: true }))
+      .thread
+    const answers = after.turns[1].items
+      .filter((item: any) => item.type === 'agentMessage')
+      .map((item: any) => item.text)
+    assert.equal(answers.length, 1, '子线程只显示子代理自己的回答')
+    assert.match(answers[0], /^CHILD_FOLLOWUP_ANSWER/)
+
+    // 追问结束后父线程照常继续，普通回合不再受“只许转交”的限制。
+    model.enqueue(() => [{ type: 'text', text: 'MAIN_NEXT_TURN' }])
+    const next = await client.request('turn/start', {
+      threadId: thread.id,
+      input: [{ type: 'text', text: '继续主任务' }],
+    })
+    await assertCompleted(client, model, next.turn.id)
+    assert.deepEqual(cliPids(), live)
+    model.assertConsumed()
+  } finally {
+    const tree = descendants(client.process.pid as number).map((row) => row.pid)
+    await client.close()
+    await model.close()
+    killAll(tree)
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
   }
 })

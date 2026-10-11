@@ -27,7 +27,13 @@ export class ProtocolClient {
   onTool: ((params: any) => Promise<unknown>) | null = null
   onServerRequest: ((method: string, params: any) => Promise<unknown>) | null = null
 
-  private constructor(home: string, baseURL: string, mock: boolean, auth: 'api-key' | 'oauth') {
+  private constructor(
+    home: string,
+    baseURL: string,
+    mock: boolean,
+    auth: 'api-key' | 'oauth',
+    extraEnv: Record<string, string>,
+  ) {
     this.home = home
     const endpoint = new URL(baseURL)
     if (
@@ -62,6 +68,7 @@ export class ProtocolClient {
       NODE_NO_WARNINGS: '1',
       CHA_CLAUDE_SDK_DEBUG: '1',
       DEBUG_CLAUDE_AGENT_SDK: '1',
+      ...extraEnv,
     }
     this.process = spawn(
       process.execPath,
@@ -135,10 +142,12 @@ export class ProtocolClient {
     baseURL: string,
     mock = false,
     auth: 'api-key' | 'oauth' = 'api-key',
+    // 只用于适配器自己的开关；模型凭据、代理等仍然不能传进来。
+    extraEnv: Record<string, string> = {},
   ): Promise<ProtocolClient> {
     if (!mock) await requireClaudeCliFor(home)
     await mkdir(join(home, 'claude'), { recursive: true })
-    const client = new ProtocolClient(home, baseURL, mock, auth)
+    const client = new ProtocolClient(home, baseURL, mock, auth, extraEnv)
     try {
       await client.request('initialize', {
         clientInfo: { name: 'protocol-test', title: null, version: '1.0.0' },

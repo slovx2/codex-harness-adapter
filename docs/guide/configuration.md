@@ -159,6 +159,8 @@ export CHA_CLAUDE_NODE="/absolute/path/to/node"
 | `CHA_CLAUDE_ALLOWED_TOOLS` | Pre-approved tools. |
 | `CHA_CLAUDE_ADD_DIRS` | Extra directories exposed to Claude. |
 | `CHA_CLAUDE_AUTO_WORKTREE` / `_WORKTREE_ROOT` | Per-thread worktree isolation. |
-| `CHA_CLAUDE_IDLE_EXIT_MS` | 仅 shim：守护进程空闲退出；本地入口固定为 `0`。 |
+| `CHA_CLAUDE_IDLE_EXIT_MS` | 仅 shim：守护进程空闲退出；本地入口固定为 `0`。还有 Claude 进程在看管后台命令时不算空闲。 |
+| `CHA_CLAUDE_KEEP_ALIVE_SESSIONS` | 同时保留后台命令的 Claude 会话数上限，默认 `8`。回合结束时还有后台命令在跑，该会话的 Claude 进程就留下（每个约占 120–220 MB 内存）；超出上限的会话不保留，后台命令随回合结束而停止并有提示。设为 `0` 关闭保留。 |
+| `CHA_CLAUDE_KEEP_ALIVE_DETACHED_MINUTES` | 全部客户端断开后，留着的 Claude 进程再保留多少分钟，默认 `30`；期间有客户端连回来就继续保留。`0` 表示一直保留。有回合在进行的进程不回收，包括停在等待用户确认上的回合。 |
 | `CHA_CLAUDE_MOCK` | Run the protocol without Claude credentials. |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` | Claude auth / custom endpoint configuration. Keep real values out of git. |

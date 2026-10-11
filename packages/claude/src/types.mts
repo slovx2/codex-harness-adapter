@@ -265,6 +265,12 @@ export interface FileUpdateChange {
 export interface RuntimeTurnContext {
   // 子代理追问回合：主会话只负责用 SendMessage 把用户原文转给该子代理。
   subagentRelay?: { agentId: string; message: string }
+  // CLI 会话所属的线程；追问回合跑在父线程的会话上。缺省即 threadId。
+  sessionThreadId?: string
+  // CLI 自己开的一轮（后台任务结束后的续跑）：没有用户输入，接到已在运行的那一轮上。
+  spontaneous?: boolean
+  // systemPromptAddendum 末尾的目标说明。它每回合都可能变化，进程存活期间随用户消息更新。
+  goalContext?: string | null
   permissionTools?: boolean
   permissionGrants?: import('./permission-grants.mjs').PermissionOverlay
   goalTools?: boolean
@@ -335,6 +341,8 @@ export type RuntimeEvent =
       isError?: boolean
       // SDK 的结构化工具结果（tool_use_result）；子代理的正文与用量以它为准。
       structured?: unknown
+      // 命令转入后台：这条结果只是启动回执，命令仍在运行，结束时另行通知。
+      backgroundTaskId?: string
     }
   // Agent 工具返回的只是后台启动回执：子代理仍在运行，结果稍后以 tool_result 送达。
   | { type: 'subagent_backgrounded'; toolUseId: string; agentId: string }
@@ -472,7 +480,7 @@ export type NativeModelInfo = {
   supportedEffortLevels?: string[]
 }
 
-// 本轮 CLI 中仍存活的后台 Bash 任务（Claude 的后台 shell 随每轮 CLI 退出）。
+// CLI 进程里仍存活的后台 Bash 任务。回合结束时还有任务在跑，进程就留到下一回合。
 export type RuntimeBackgroundShell = {
   taskId: string
   toolUseId: string | null
@@ -480,8 +488,31 @@ export type RuntimeBackgroundShell = {
   seq: number
 }
 
+// 后台命令结束：自己退出、被停止，或者随 CLI 进程一起结束。
+export interface RuntimeBackgroundCommandEnd {
+  taskId: string
+  toolUseId: string | null
+  status: 'completed' | 'failed' | 'stopped'
+  exitCode: number | null
+  output: string
+}
+
+// 跨回合存活的 CLI 进程在没有回合时发生的事，由协议层接手。
+export interface RuntimeSessionHandlers {
+  // CLI 自己开了一轮。协议层建好回合并以 spontaneous 上下文调用 runTurn 后返回 true；
+  // 返回 false 表示不接，运行时会打断这一轮。
+  onSpontaneousTurn(threadId: string): Promise<boolean>
+  onBackgroundCommandEnded(threadId: string, end: RuntimeBackgroundCommandEnd): void
+  // 进程已退出，仍在运行的后台命令随它结束。
+  onSessionClosed(threadId: string, reason: string): void
+}
+
 export interface ClaudeRuntime {
   supportedModels?(): Promise<NativeModelInfo[]>
+  setSessionHandlers?(handlers: RuntimeSessionHandlers): void
+  // 仍有 CLI 进程存活的线程。
+  liveSessions?(): string[]
+  closeSession?(threadId: string, reason: string): Promise<void>
   listBackgroundShells?(threadId: string): RuntimeBackgroundShell[]
   stopBackgroundShell?(threadId: string, taskId: string): Promise<boolean>
   updateTurnSettings?(

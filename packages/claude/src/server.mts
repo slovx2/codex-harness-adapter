@@ -11,6 +11,11 @@ import { ProcessRpc } from '../../shared/src/process-rpc.mjs'
 import { projectRequest } from '../../shared/src/project-rpc.mjs'
 import { allowsApproval } from './approval-policy.mjs'
 import {
+  type BackgroundCommandEntry,
+  BackgroundCommands,
+  endedCommandItem,
+} from './background-commands.mjs'
+import {
   backgroundTerminals,
   type ListedBackgroundTerminal,
   paginateBackgroundTerminals,
@@ -142,6 +147,7 @@ import type {
   NativeSessionFork,
   PermissionDecision,
   RpcPeer,
+  RuntimeBackgroundCommandEnd,
   RuntimeEvent,
   ThreadItem,
   ThreadRecord,
@@ -238,7 +244,17 @@ function turnItemsView(value: unknown): TurnItemsView {
 export class CodexClaudeAppServer {
   private readonly rateLimits = new AccountRateLimits()
   private readonly accountPeers = new Set<RpcPeer>()
-  private pendingInteractions = new PendingInteractions()
+  // 请求从一条仍连着的连接手里收回（线程的订阅换了连接）：直接告诉它撤掉卡片，不经线程路由。
+  private pendingInteractions = new PendingInteractions((peer, threadId, requestId) => {
+    try {
+      peer.send({
+        jsonrpc: '2.0',
+        method: 'serverRequest/resolved',
+        params: { threadId, requestId },
+      })
+    } catch {}
+  })
+  private closedPeers = new WeakSet<RpcPeer>()
   private activePeerByThread = new Map<string, RpcPeer>()
   private peerFeatures = new WeakMap<RpcPeer, PeerFeatures>()
   private activeTurnByThread = new Map<string, string>()
@@ -261,6 +277,13 @@ export class CodexClaudeAppServer {
   private subagentStateByTurn = new Map<string, ActiveSubagentState>()
   // 子代理追问回合占用父会话：子线程 ID → 父线程 ID，回合结束时释放。
   private relayParentByChild = new Map<string, string>()
+  // 回合结束后仍在运行的后台命令，以及 CLI 为处理它们的结果自己开的回合。
+  private readonly backgroundCommands = new BackgroundCommands()
+  private spontaneousTurns = new Set<string>()
+  // 已经交到运行时手里的回合：运行时再说“没有回合在跑”，就是它已经交还、协议层还在收尾。
+  private handedToRuntime = new Set<string>()
+  private turnClearWaiters = new Map<string, Array<() => void>>()
+  private detachedReapTimer: NodeJS.Timeout | null = null
   private readonly fuzzySearch = new FuzzyFileSearch()
   private readonly fuzzySessions = new FuzzySearchSessions((peer, message) =>
     this.notify(peer, message),
@@ -293,10 +316,20 @@ export class CodexClaudeAppServer {
   constructor(store: SessionStore, runtime: ClaudeRuntime) {
     this.store = store
     this.runtime = runtime
+    this.runtime.setSessionHandlers?.({
+      onSpontaneousTurn: (threadId) => this.spontaneousTurn(threadId),
+      onBackgroundCommandEnded: (threadId, end) => {
+        const entry = this.backgroundCommands.take(threadId, end.taskId)
+        if (entry) this.finishBackgroundCommand(entry, end)
+      },
+      onSessionClosed: (threadId, reason) => this.sessionClosed(threadId, reason),
+    })
     this.loadPersistedConfig()
   }
 
   async handle(peer: RpcPeer, message: WireMessage): Promise<void> {
+    // 还在说话的连接就是连着的。
+    this.closedPeers.delete(peer)
     if ('method' in message && message.method) {
       debugLog('rpc.request', {
         peerId: peer.id,
@@ -321,18 +354,42 @@ export class CodexClaudeAppServer {
     }
   }
 
-  closePeer(peer: RpcPeer): void {
+  // final：这条连接就是进程的寿命（标准输入输出），它断开后适配器随即退出，不会再有别的连接。
+  closePeer(peer: RpcPeer, final = false): void {
     this.accountPeers.delete(peer)
+    this.closedPeers.add(peer)
+    // 等不来下一个订阅者：趁还能写，告诉对端它手里的请求已经失效。
+    if (final) this.pendingInteractions.cancelPeer(peer.id)
     this.skills.closePeer(peer.id)
     this.mcpOAuth.closePeer(peer.id)
     this.mcp.closePeer(peer.id)
-    this.pendingInteractions.cancelPeer(peer.id)
     this.filesystem.closePeer(peer.id)
     this.processes.closePeer(peer.id)
     debugLog('peer.close', { peerId: peer.id })
     for (const [threadId, activePeer] of this.activePeerByThread.entries()) {
       if (activePeer.id === peer.id) this.activePeerByThread.delete(threadId)
     }
+    // 它手里等人回答的请求不作废：回到没人可送的状态，仍有别的连接在看这个线程就改送过去。
+    this.pendingInteractions.dropPeer(peer.id)
+    this.pendingInteractions.reroute()
+    this.armDetachedReap()
+  }
+
+  // 所有连接都断开后，看管后台命令的进程再留一段时间；期间有连接回来就继续留。
+  private armDetachedReap(): void {
+    const linger = detachedLingerMs()
+    if (this.stopped || this.detachedReapTimer || linger <= 0 || this.accountPeers.size > 0) return
+    if ((this.runtime.liveSessions?.().length ?? 0) === 0) return
+    this.detachedReapTimer = setTimeout(() => {
+      this.detachedReapTimer = null
+      if (this.stopped || this.accountPeers.size > 0) return
+      for (const threadId of this.runtime.liveSessions?.() ?? [])
+        if (!this.sessionHolder(threadId))
+          void this.runtime.closeSession?.(threadId, '所有客户端已断开')
+      // 有回合占着的进程这次不收（包括停在那里等人确认的回合）；仍然没有连接的话过一段再看。
+      this.armDetachedReap()
+    }, linger)
+    this.detachedReapTimer.unref()
   }
 
   async stop(): Promise<void> {
@@ -357,8 +414,10 @@ export class CodexClaudeAppServer {
     this.store.close()
   }
 
+  // 还有 CLI 进程在看管后台命令时，适配器也不算空闲。
   hasActiveTurns(): boolean {
     return (
+      (this.runtime.liveSessions?.().length ?? 0) > 0 ||
       this.activeTurnByThread.size > 0 ||
       this.scheduledGoals.size > 0 ||
       this.scheduledQueues.size > 0 ||
@@ -447,6 +506,9 @@ export class CodexClaudeAppServer {
       })
     } finally {
       if (locked) this.nativeMutations.delete(threadId as string)
+      // 这次请求可能让某个线程有了订阅连接（恢复、发消息等）：应答发出之后，
+      // 把等着人回答的请求送给它，先后与原生“恢复后重放挂起的请求”一致。
+      this.pendingInteractions.reroute()
     }
   }
 
@@ -543,6 +605,8 @@ export class CodexClaudeAppServer {
         // Claude 用户设置（如模型服务）变更后，新连接看到的模型目录随之刷新。
         await loadRuntimeModelCatalog(this.runtime)
         this.accountPeers.add(peer)
+        if (this.detachedReapTimer) clearTimeout(this.detachedReapTimer)
+        this.detachedReapTimer = null
         const initParams = asRecord(params)
         const clientInfo = asRecord(initParams.clientInfo)
         const capabilities = asRecord(initParams.capabilities)
@@ -564,6 +628,7 @@ export class CodexClaudeAppServer {
             method: 'account/updated',
             params: { authMode: 'apikey', planType: null },
           })
+          this.announceUnattended(peer)
           void Promise.resolve()
             .then(() => this.mcpProbe(peer, this.mcpScope()))
             .catch((error: unknown) => {
@@ -640,8 +705,9 @@ export class CodexClaudeAppServer {
       case 'thread/delete': {
         const threadId = requiredString(asRecord(params).threadId, 'threadId')
         if (!this.store.getThread(threadId)) throw new ProtocolError(-32602, '未知会话')
-        if (this.activeTurnByThread.has(threadId))
-          throw new ProtocolError(-32009, '活动会话不能删除')
+        // 子线程的追问回合借用这个线程的进程：它在跑时这个线程同样算活动。
+        if (this.sessionHolder(threadId)) throw new ProtocolError(-32009, '活动会话不能删除')
+        await this.runtime.closeSession?.(threadId, '会话已删除')
         this.store.deleteThread(threadId)
         const subscriber = this.activePeerByThread.get(threadId)
         // 先移除路由，避免删除调用者的通知被重定向到原订阅者。
@@ -1465,9 +1531,11 @@ export class CodexClaudeAppServer {
     this.store.setArchived(threadId, archived)
     if (archived) {
       this.scheduledGoals.delete(threadId)
-      const turnId = this.activeTurnByThread.get(threadId)
-      const peer = this.activePeerByThread.get(threadId) ?? caller
-      if (turnId) await this.turnInterrupt(peer, { threadId, turnId })
+      // 占着这个线程的进程的回合也可能是子线程的追问，一并打断。
+      const holder = this.sessionHolder(threadId)
+      if (holder)
+        await this.turnInterrupt(this.activePeerByThread.get(holder.threadId) ?? caller, holder)
+      await this.runtime.closeSession?.(threadId, '会话已归档')
     }
     this.notifyThread(threadId, {
       method: archived ? 'thread/archived' : 'thread/unarchived',
@@ -1929,7 +1997,7 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error(`unknown thread: ${threadId}`)
-    if (this.activeTurnByThread.has(threadId) || this.interruptingByThread.has(threadId))
+    if (this.sessionHolder(threadId) || this.interruptingByThread.has(threadId))
       throw new ProtocolError(-32009, '活动会话不能回退')
     // Honor the protocol's `numTurns: u32, must be >= 1` — drop that many
     // turns from the end of the thread. Without this, App's rewind UI sends
@@ -1938,6 +2006,8 @@ export class CodexClaudeAppServer {
     const numTurns = params.numTurns
     if (typeof numTurns !== 'number' || !Number.isInteger(numTurns) || numTurns < 1)
       throw new ProtocolError(-32602, 'numTurns 必须是正整数')
+    // 回退会换一份原生历史；留着的进程还握着旧的那份，连同后台命令一起结束。
+    await this.runtime.closeSession?.(threadId, '会话已回退')
     const retained = this.store.listTurns(threadId).slice(0, -numTurns)
     let nativeFork: NativeSessionFork | null = null
     if (thread.claudeSessionId && retained.length) {
@@ -2019,6 +2089,201 @@ export class CodexClaudeAppServer {
     return {}
   }
 
+  // ── 跨回合存活的后台命令 ──
+
+  // 后台命令的启动回执：条目保持 inProgress，命令结束时再补完成通知。
+  private trackBackgroundCommand(
+    sessionThreadId: string,
+    threadId: string,
+    turnId: string,
+    itemId: string,
+    taskId: string,
+    startedAtMs: number | undefined,
+  ): boolean {
+    const item = this.store.getTurn(turnId)?.items.find((entry) => entry.id === itemId)
+    if (item?.type !== 'commandExecution') return false
+    this.backgroundCommands.add(sessionThreadId, {
+      taskId,
+      threadId,
+      turnId,
+      itemId,
+      startedAtMs: startedAtMs ?? nowMillis(),
+    })
+    return true
+  }
+
+  // 通知带的是命令当初所在的回合，那个回合多半早已结束。
+  private finishBackgroundCommand(
+    entry: BackgroundCommandEntry,
+    end: Pick<RuntimeBackgroundCommandEnd, 'status' | 'exitCode' | 'output'>,
+  ): void {
+    const threadId = entry.threadId
+    const durationMs = Math.max(0, nowMillis() - entry.startedAtMs)
+    const updated = this.store.updateItem(entry.turnId, entry.itemId, (item) =>
+      endedCommandItem(item, end, durationMs),
+    )
+    const item = updated?.items.find((candidate) => candidate.id === entry.itemId)
+    if (!item) return
+    if (end.output)
+      this.notifyThread(threadId, {
+        method: 'item/commandExecution/outputDelta',
+        params: { threadId, turnId: entry.turnId, itemId: entry.itemId, delta: end.output },
+      })
+    this.notifyThread(threadId, {
+      method: 'item/completed',
+      params: { threadId, turnId: entry.turnId, item, completedAtMs: nowMillis() },
+    })
+  }
+
+  // CLI 进程退出：它名下还在跑的后台命令都已随它结束。
+  private sessionClosed(threadId: string, reason: string): void {
+    debugLog('runtime.session.closed', { threadId, reason })
+    for (const entry of this.backgroundCommands.drain(threadId))
+      this.finishBackgroundCommand(entry, {
+        status: 'stopped',
+        exitCode: null,
+        output: '',
+      })
+    this.idleCheckHandler?.()
+  }
+
+  // CLI 自己开了一轮（后台命令结束后把结果告诉模型）。没有用户输入，适配器为它建一个回合。
+  private async spontaneousTurn(threadId: string): Promise<boolean> {
+    if (this.stopped) return false
+    const thread = this.store.getThread(threadId)
+    if (!thread || thread.archived) return false
+    // 占着这个进程的回合：线程自己的，或者借用它做追问的子线程的。
+    const holder = this.sessionHolder(threadId)
+    if (holder) {
+      if (this.interruptingByThread.has(holder.threadId)) return false
+      // 回合还没交到运行时手里：它会接到同一个进程上，CLI 自己开的这一轮并进那个回合。
+      if (!this.handedToRuntime.has(holder.turnId)) return true
+      // 运行时已经把回合交还，协议层还在收尾（算差异、发终态）：等它收完再为这一轮建回合。
+      await this.activeTurnCleared(holder.threadId, holder.turnId)
+      return this.spontaneousTurn(threadId)
+    }
+    if (
+      this.interruptingByThread.has(threadId) ||
+      this.nativeMutations.has(threadId) ||
+      this.store.pendingContextInjection(threadId) ||
+      this.store.listTurns(threadId).some((turn) => turn.status === 'inProgress')
+    )
+      return false
+    // 没有连接订阅这个线程：回合照常执行并落库，通知无处可送；
+    // 遇到需要确认的调用，回合停在那里，等有客户端连上并订阅这个线程。
+    const peer = this.activePeerByThread.get(threadId) ?? detachedPeer(threadId)
+    const turn: TurnRecord = {
+      id: newId(),
+      threadId,
+      status: 'inProgress',
+      startedAt: nowSeconds(),
+      completedAt: null,
+      durationMs: null,
+      items: [],
+      diff: '',
+      error: null,
+    }
+    this.store.upsertTurn(turn)
+    this.spontaneousTurns.add(turn.id)
+    this.goals.begin(threadId, turn.id)
+    recordRunEvent('turn.started', {
+      threadId,
+      turnId: turn.id,
+      cwd: thread.cwd,
+      model: thread.model,
+      runtimeBackend: thread.runtimeBackend,
+      purpose: 'normal',
+    })
+    this.markActiveTurn(threadId, turn.id)
+    this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
+    setImmediate(() => {
+      this.notify(peer, {
+        method: 'turn/started',
+        params: { threadId, turn: this.toLifecycleTurn(turn) },
+      })
+      void this.runRuntimeTurn(peer, thread, turn, '', { threadId, _spontaneous: true }).catch(
+        (error) => this.failTurn(peer, threadId, turn, error),
+      )
+    })
+    return true
+  }
+
+  private sessionHolder(threadId: string): { threadId: string; turnId: string } | null {
+    const own = this.activeTurnByThread.get(threadId)
+    if (own) return { threadId, turnId: own }
+    for (const [child, parent] of this.relayParentByChild) {
+      const turnId = parent === threadId ? this.activeTurnByThread.get(child) : undefined
+      if (turnId) return { threadId: child, turnId }
+    }
+    return null
+  }
+
+  // 等某个活动回合收尾完（不再占着线程）。
+  private activeTurnCleared(threadId: string, turnId: string): Promise<void> {
+    if (this.activeTurnByThread.get(threadId) !== turnId) return Promise.resolve()
+    return new Promise((resolve) => {
+      const waiters = this.turnClearWaiters.get(threadId) ?? []
+      waiters.push(resolve)
+      this.turnClearWaiters.set(threadId, waiters)
+    })
+  }
+
+  // 用户发消息时 CLI 正好在自己续跑：用户并不知道有回合在跑，不能让这次提交失败。
+  // 把消息并进那个回合（CLI 会接着处理它），返回的就是那个回合。
+  private async joinSpontaneousTurn(
+    threadId: string,
+    params: Record<string, unknown>,
+    messageId: string | null,
+    hash: string,
+  ): Promise<TurnRecord | null> {
+    const turnId = this.activeTurnByThread.get(threadId)
+    if (!turnId || !this.spontaneousTurns.has(turnId) || this.interruptingByThread.has(threadId))
+      return null
+    if (this.store.getTurn(turnId)?.status !== 'inProgress') return null
+    const input = Array.isArray(params.input) ? (params.input as UserInput[]) : []
+    if (extractImageInputs(input).images.length > 0)
+      throw new ProtocolError(-32009, '会话正在处理后台命令的结果，带图片的消息请稍后再发')
+    const startup = this.runtimeReadyByTurn.get(turnId)
+    if (startup && !(await startup.ready)) return null
+    if (this.activeTurnByThread.get(threadId) !== turnId) return null
+    const item: ThreadItem = {
+      type: 'userMessage',
+      id: newId(),
+      content: input,
+      clientId: messageId,
+    }
+    // 先送进去再落库：送不进去时这条消息不能留下“已提交”的记录。
+    try {
+      await this.runtime.steer(threadId, textFromInput(input))
+    } catch (error) {
+      if (!(error instanceof ProtocolError) || error.code !== -32009) throw error
+      // 那一轮刚好结束：等它收尾完，按普通回合提交。
+      await this.activeTurnCleared(threadId, turnId)
+      return null
+    }
+    this.store.saveSteeredMessage(turnId, item, messageId, hash)
+    return this.store.getTurn(turnId)
+  }
+
+  private failTurn(peer: RpcPeer, threadId: string, turn: TurnRecord, error: Error): void {
+    if (this.stopped) return
+    const current = this.store.getTurn(turn.id)
+    if (current && current.status !== 'inProgress') return
+    this.finishGoal(threadId, turn.id, 'failed')
+    const completed = this.store.completeTurn(turn.id, 'failed', { message: error.message }) ?? turn
+    this.pendingInteractions.cancelThread(threadId)
+    this.notify(peer, {
+      method: 'error',
+      params: { threadId, turnId: turn.id, willRetry: false, error: { message: error.message } },
+    })
+    this.notify(peer, {
+      method: 'turn/completed',
+      params: { threadId, turn: this.toLifecycleTurn(completed) },
+    })
+    this.clearActiveTurn(threadId)
+    this.setThreadStatus(peer, threadId, { type: 'idle' })
+  }
+
   // 与原生 load_thread 一致：会话必须存在且已加载（有连接订阅）。
   private loadedThreadForTerminals(params: Record<string, unknown>): ThreadRecord {
     const threadId = requiredString(params.threadId, 'threadId')
@@ -2029,8 +2294,10 @@ export class CodexClaudeAppServer {
   }
 
   private listedBackgroundTerminals(thread: ThreadRecord): ListedBackgroundTerminal[] {
-    const turnId = this.activeTurnByThread.get(thread.id)
-    const items = turnId ? (this.store.getTurn(turnId)?.items ?? []) : []
+    const turnIds = new Set(this.backgroundCommands.list(thread.id).map((entry) => entry.turnId))
+    const active = this.activeTurnByThread.get(thread.id)
+    if (active) turnIds.add(active)
+    const items = [...turnIds].flatMap((turnId) => this.store.getTurn(turnId)?.items ?? [])
     return backgroundTerminals(
       this.runtime.listBackgroundShells?.(thread.id) ?? [],
       thread.cwd,
@@ -2309,6 +2576,7 @@ export class CodexClaudeAppServer {
     compactItem: ThreadItem,
   ): Promise<void> {
     let compacted = false
+    this.handedToRuntime.add(turnId)
     await this.runtime.runTurn(
       {
         threadId: thread.id,
@@ -2389,6 +2657,10 @@ export class CodexClaudeAppServer {
       const submitted = this.store.submittedTurn(threadId, messageId, hash)
       if (submitted) return { turn: this.toLifecycleTurn(submitted) }
     }
+    const merged = queuedId
+      ? null
+      : await this.joinSpontaneousTurn(threadId, params, messageId, hash)
+    if (merged) return { turn: this.toLifecycleTurn(merged) }
     if (
       this.activeTurnByThread.has(threadId) ||
       this.interruptingByThread.has(threadId) ||
@@ -2528,25 +2800,7 @@ export class CodexClaudeAppServer {
       void this.runRuntimeTurn(peer, thread, turn, prompt, {
         ...params,
         _imageInputs: images,
-      }).catch((error) => {
-        if (this.stopped) return
-        const current = this.store.getTurn(turnId)
-        if (current && current.status !== 'inProgress') return
-        this.finishGoal(threadId, turnId, 'failed')
-        const completed =
-          this.store.completeTurn(turnId, 'failed', { message: error.message }) ?? turn
-        this.pendingInteractions.cancelThread(threadId)
-        this.notify(peer, {
-          method: 'error',
-          params: { threadId, turnId, willRetry: false, error: { message: error.message } },
-        })
-        this.notify(peer, {
-          method: 'turn/completed',
-          params: { threadId, turn: this.toLifecycleTurn(completed) },
-        })
-        this.clearActiveTurn(threadId)
-        this.setThreadStatus(peer, threadId, { type: 'idle' })
-      })
+      }).catch((error) => this.failTurn(peer, threadId, turn, error))
     })
     return { turn: publicTurn }
   }
@@ -2934,6 +3188,11 @@ export class CodexClaudeAppServer {
         return
       watchdogTimer = setTimeout(() => {
         watchdogTimer = null
+        // 回合停在那里等人确认不算子代理没有回音：接着等，重新计时。
+        if (this.pendingInteractions.has(thread.id)) {
+          armWatchdog()
+          return
+        }
         // Flip this before resolving the race so an already-buffered SDK event
         // cannot create a fresh child after the watchdog has decided to fail.
         acceptRuntimeEvents = false
@@ -2948,6 +3207,7 @@ export class CodexClaudeAppServer {
       this.activeTurnByThread.get(thread.id) === turn.id
     if (!turnIsActive()) return
     this.runtimeReadyByTurn.get(turn.id)?.resolve(true)
+    this.handedToRuntime.add(turn.id)
     const runtimeTurn = this.runtime.runTurn(
       {
         threadId: thread.id,
@@ -2959,7 +3219,14 @@ export class CodexClaudeAppServer {
         trackGoalTools:
           turnPurpose === 'normal' && this.store.threadGoal(thread.id)?.status === 'active',
         prompt: effectivePrompt,
-        ...(relay ? { subagentRelay: { agentId: relay.agentId, message: prompt } } : {}),
+        ...(relay
+          ? {
+              subagentRelay: { agentId: relay.agentId, message: prompt },
+              sessionThreadId: relay.parent.id,
+            }
+          : {}),
+        ...(params._spontaneous === true ? { spontaneous: true } : {}),
+        goalContext: turnPurpose === 'normal' ? this.goals.context(runtimeThread.id) : null,
         cwd: relay ? relay.parent.cwd : stringOr(params.cwd, thread.cwd),
         runtimeType: isCodexThread ? 'codex-proxy' : null,
         model: resolvedModel,
@@ -3253,7 +3520,8 @@ export class CodexClaudeAppServer {
             // Child notifications must follow the current parent peer. This
             // matters after unix-daemon reconnects, when the old peer is gone
             // before the child publishes its response.
-            this.activePeerByThread.set(childThreadId, peer)
+            // 没有连接订阅父线程时不登记：占位连接进了路由表，子线程的通知会一直被丢到父线程恢复为止。
+            if (this.isConnected(peer)) this.activePeerByThread.set(childThreadId, peer)
             const childTurn: TurnRecord = {
               id: newId(),
               threadId: childThreadId,
@@ -3761,6 +4029,18 @@ export class CodexClaudeAppServer {
             }
             const itemId = itemIds.get(event.toolUseId)
             if (!itemId) return
+            if (
+              event.backgroundTaskId &&
+              this.trackBackgroundCommand(
+                relay?.parent.id ?? thread.id,
+                thread.id,
+                turn.id,
+                itemId,
+                event.backgroundTaskId,
+                itemStartedAtMs.get(itemId),
+              )
+            )
+              return
             const resultText = toolResultText(event.content)
             const durationMs = (() => {
               const started = itemStartedAtMs.get(itemId)
@@ -5513,7 +5793,7 @@ export class CodexClaudeAppServer {
     if (!active || !turn) return
     const message = '回合已终止；未确认的工具结果不能重放'
     for (const item of turn.items) {
-      if (!active.has(item.id)) continue
+      if (!active.has(item.id) || this.backgroundCommands.isRunning(turnId, item.id)) continue
       let completed: ThreadItem = item
       if (item.type === 'dynamicToolCall')
         completed = {
@@ -5546,10 +5826,39 @@ export class CodexClaudeAppServer {
   ): void {
     this.store.updateThreadStatus(threadId, status)
     const target = peer ?? this.activePeerByThread.get(threadId)
-    if (target)
-      this.notify(target, { method: 'thread/status/changed', params: { threadId, status } })
+    if (!target) return
+    const notification = { method: 'thread/status/changed', params: { threadId, status } }
+    // 与原生一致：没有连接在看这个线程时（没人订阅，或者发起回合的连接已经断开），
+    // 状态变化发给所有连接，没在看它的客户端据此知道它又动了。
+    if (this.isConnected(this.peerForParams(target, notification.params)))
+      this.notify(target, notification)
+    else for (const connected of this.accountPeers) this.notify(connected, notification)
   }
 
+  private isConnected(peer: RpcPeer): boolean {
+    return !isDetachedPeer(peer) && !this.closedPeers.has(peer)
+  }
+
+  // 新连接握手之后：告诉它哪些线程正停在那里等人确认却没有客户端在看。
+  // 桌面端收到 active 的状态通知会把线程拉进列表并标成等待中；点开（恢复）后确认请求随即送达。
+  private announceUnattended(peer: RpcPeer): void {
+    for (const threadId of this.pendingInteractions.unattended()) {
+      const status = this.store.getThread(threadId)?.status
+      if (status?.type !== 'active') continue
+      // 只发给这条新连接，不经 notify 的按线程改道；调试日志照记，排查时看得到这条通知。
+      const params = { threadId, status }
+      debugLog('rpc.notify', {
+        peerId: peer.id,
+        originalPeerId: null,
+        method: 'thread/status/changed',
+        params: summarizeRpcParams('thread/status/changed', params),
+      })
+      peer.send({ jsonrpc: '2.0', method: 'thread/status/changed', params })
+    }
+  }
+
+  // 向客户端发请求并等回答。线程此刻没有客户端在看时不拒绝也不超时：请求留着，
+  // 等有连接订阅这个线程再送过去（见 PendingInteractions）。
   private sendServerRequest(
     peer: RpcPeer,
     method: string,
@@ -5557,13 +5866,21 @@ export class CodexClaudeAppServer {
     params: unknown,
     signal?: AbortSignal,
   ): Promise<unknown> {
-    const target = this.peerForParams(peer, params)
     const threadId = stringOr(asRecord(params).threadId, '')
-    return this.pendingInteractions.request(target, method, id, params, signal, () => {
-      this.notify(target, {
-        method: 'serverRequest/resolved',
-        params: { threadId, requestId: id },
-      })
+    // 该由谁来答：线程的订阅连接；没人订阅时是发起回合的连接；它也断开了就没有人可送。
+    const target = (): RpcPeer | null => {
+      const resolved = this.peerForParams(peer, params)
+      return this.isConnected(resolved) ? resolved : null
+    }
+    return this.pendingInteractions.request(target, method, id, params, {
+      ...(signal ? { signal } : {}),
+      onFinished: (holder) => {
+        if (!holder) return
+        this.notify(holder, {
+          method: 'serverRequest/resolved',
+          params: { threadId, requestId: id },
+        })
+      },
     })
   }
 
@@ -5625,9 +5942,17 @@ export class CodexClaudeAppServer {
     if (turnId) {
       this.runtimeReadyByTurn.get(turnId)?.resolve(false)
       this.runtimeReadyByTurn.delete(turnId)
+      this.spontaneousTurns.delete(turnId)
+      this.handedToRuntime.delete(turnId)
     }
     const existed = this.activeTurnByThread.delete(threadId)
+    const waiters = this.turnClearWaiters.get(threadId)
+    if (waiters) {
+      this.turnClearWaiters.delete(threadId)
+      for (const resolve of waiters) resolve()
+    }
     this.relayParentByChild.delete(threadId)
+    this.armDetachedReap()
     if (existed && this.activeTurnByThread.size === 0) this.idleCheckHandler?.()
   }
 
@@ -5709,3 +6034,21 @@ export class CodexClaudeAppServer {
 }
 
 import { sandboxCommand } from './command-sandbox.mjs'
+
+// 线程没有连接订阅时的占位：通知无处可送，路由仍先看线程当前的订阅者。
+const DETACHED_PEER_PREFIX = 'detached:'
+
+function detachedPeer(threadId: string): RpcPeer {
+  return { id: DETACHED_PEER_PREFIX + threadId, send: () => {}, close: () => {} }
+}
+
+function isDetachedPeer(peer: RpcPeer): boolean {
+  return peer.id.startsWith(DETACHED_PEER_PREFIX)
+}
+
+// 所有连接断开后，看管后台命令的 CLI 进程再保留多久；0 表示一直保留。
+function detachedLingerMs(): number {
+  const raw = process.env.CHA_CLAUDE_KEEP_ALIVE_DETACHED_MINUTES
+  const minutes = raw == null || raw.trim() === '' ? 30 : Number(raw)
+  return Number.isFinite(minutes) && minutes >= 0 ? minutes * 60_000 : 30 * 60_000
+}

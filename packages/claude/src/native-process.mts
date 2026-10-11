@@ -64,16 +64,29 @@ export class NativeProcess {
     return child
   }
 
+  get hasExited(): boolean {
+    return this.closed
+  }
+
   async wait(milliseconds: number): Promise<boolean> {
     return succeedsWithin(this.exited, milliseconds)
   }
 
   allowGracefulClose(): void {
     if (this.gracefulClose || this.closed) return
+    if (this.control('g')) this.gracefulClose = true
+  }
+
+  // 让守护进程记下 CLI 当前的后台命令进程；CLI 崩溃时守护进程据此清理。
+  trackBackgroundProcesses(): void {
+    if (!this.closed) this.control('s')
+  }
+
+  private control(flag: string): boolean {
     const control = this.child?.stdio[4]
-    if (!control || !('write' in control)) return
-    this.gracefulClose = true
-    control.write('g')
+    if (!control || !('write' in control)) return false
+    control.write(flag)
+    return true
   }
 
   async stopIfUnconfirmed(): Promise<void> {
@@ -90,17 +103,19 @@ export class NativeProcess {
 
   private async stopProcess(): Promise<void> {
     if (!this.child || this.closed) return
-    this.signal('SIGTERM')
-    if (await this.wait(1_000)) return
-    this.signal('SIGKILL')
+    // 只通知守护进程：它先让 CLI 自己停掉后台命令并退出，再清理整个进程组。
+    // 直接对进程组发信号会让 CLI 来不及收尾，后台命令变成孤儿。
+    this.signal('SIGTERM', false)
+    if (await this.wait(2_000)) return
+    this.signal('SIGKILL', true)
     if (!(await this.wait(2_000))) throw new Error('Claude CLI 未能在期限内退出，禁止释放执行屏障')
   }
 
-  private signal(signal: NodeJS.Signals): void {
+  private signal(signal: NodeJS.Signals, group: boolean): void {
     const child = this.child
     if (!child || this.closed || !child.pid) return
     try {
-      if (process.platform === 'win32') child.kill(signal)
+      if (process.platform === 'win32' || !group) child.kill(signal)
       else process.kill(-child.pid, signal)
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error

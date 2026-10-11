@@ -16,6 +16,7 @@ import type {
   NativeSessionFork,
   RuntimeBackgroundShell,
   RuntimeHandlers,
+  RuntimeSessionHandlers,
   RuntimeTurnContext,
 } from './types.mjs'
 import { debugLog } from './util.mjs'
@@ -33,6 +34,7 @@ export function createRuntime(): ClaudeRuntime {
 class SelectableRuntime implements ClaudeRuntime {
   private runtimes = new Map<RuntimeBackendType, ClaudeRuntime>()
   private activeRuntimeByThread = new Map<string, ClaudeRuntime>()
+  private sessionHandlers: RuntimeSessionHandlers | null = null
   private readonly config: RuntimeConfig
 
   constructor(config: RuntimeConfig) {
@@ -116,13 +118,32 @@ class SelectableRuntime implements ClaudeRuntime {
     return runtime.updateTurnSettings(threadId, turnId, settings)
   }
 
+  // 后台命令属于跨回合存活的进程，没有回合在跑时也要能列出和停止。
   listBackgroundShells(threadId: string): RuntimeBackgroundShell[] {
-    return this.activeRuntimeByThread.get(threadId)?.listBackgroundShells?.(threadId) ?? []
+    return [...this.runtimes.values()].flatMap(
+      (runtime) => runtime.listBackgroundShells?.(threadId) ?? [],
+    )
   }
 
   async stopBackgroundShell(threadId: string, taskId: string): Promise<boolean> {
-    const runtime = this.activeRuntimeByThread.get(threadId)
-    return (await runtime?.stopBackgroundShell?.(threadId, taskId)) ?? false
+    for (const runtime of this.runtimes.values())
+      if (await runtime.stopBackgroundShell?.(threadId, taskId)) return true
+    return false
+  }
+
+  setSessionHandlers(handlers: RuntimeSessionHandlers): void {
+    this.sessionHandlers = handlers
+    for (const runtime of this.runtimes.values()) runtime.setSessionHandlers?.(handlers)
+  }
+
+  liveSessions(): string[] {
+    return [...this.runtimes.values()].flatMap((runtime) => runtime.liveSessions?.() ?? [])
+  }
+
+  async closeSession(threadId: string, reason: string): Promise<void> {
+    await Promise.all(
+      [...this.runtimes.values()].map((runtime) => runtime.closeSession?.(threadId, reason)),
+    )
   }
 
   async steer(threadId: string, prompt: string): Promise<void> {
@@ -147,6 +168,7 @@ class SelectableRuntime implements ClaudeRuntime {
     const existing = this.runtimes.get(type)
     if (existing) return existing
     const runtime = instantiateRuntime(this.config, type)
+    if (this.sessionHandlers) runtime.setSessionHandlers?.(this.sessionHandlers)
     this.runtimes.set(type, runtime)
     return runtime
   }

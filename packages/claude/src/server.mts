@@ -1211,9 +1211,6 @@ export class CodexClaudeAppServer {
   }
 
   private threadList(params: Record<string, unknown>): unknown {
-    const sourceKinds = Array.isArray(params.sourceKinds)
-      ? params.sourceKinds.filter((value): value is string => typeof value === 'string')
-      : []
     const parentThreadId =
       typeof params.parentThreadId === 'string' && params.parentThreadId.length > 0
         ? params.parentThreadId
@@ -1222,6 +1219,15 @@ export class CodexClaudeAppServer {
       typeof params.ancestorThreadId === 'string' && params.ancestorThreadId.length > 0
         ? params.ancestorThreadId
         : null
+    if (parentThreadId != null && ancestorThreadId != null)
+      throw new ProtocolError(-32600, 'parentThreadId 与 ancestorThreadId 不能同时指定')
+    // 与 Codex 原生一致：不指定来源时只列用户自己的线程，子代理线程不混进普通列表；
+    // 按父线程或祖先线程查且不指定来源时不限来源。
+    const sourceKinds = Array.isArray(params.sourceKinds)
+      ? params.sourceKinds.filter((value): value is string => typeof value === 'string')
+      : parentThreadId != null || ancestorThreadId != null
+        ? undefined
+        : []
     const sortKey =
       params.sortKey === 'updated_at' ||
       params.sortKey === 'recency_at' ||
@@ -3146,12 +3152,7 @@ export class CodexClaudeAppServer {
             if (!activeSubagents.has(event.toolUseId)) return
             backgroundSubagents.add(event.toolUseId)
             const ctx = subagentContexts.get(event.toolUseId)
-            const childThread = ctx ? this.store.getThread(ctx.childThreadId) : null
-            if (childThread) {
-              // 与完成时一致：昵称换成 SDK 的 agentId，后续按它寻址这个子代理。
-              childThread.agentNickname = event.agentId
-              this.store.upsertThread(childThread)
-            }
+            if (ctx) this.saveSubagentId(ctx.childThreadId, event.agentId)
             return
           }
           if (event.type === 'subagent_event') {
@@ -3186,7 +3187,7 @@ export class CodexClaudeAppServer {
           }
           if (event.type === 'tool_use' && !itemIds.has(event.toolUseId)) completeMessage()
           if (event.type === 'tool_use' && isSubagentToolName(event.toolName)) {
-            // Spawn the ephemeral child, then mirror MultiAgent V2: a
+            // Spawn the child thread, then mirror MultiAgent V2: a
             // subAgentActivity started item plus spawnAgent/wait tool state.
             //
             // Concept alignment: Claude's `subagent_type` (e.g. "general-
@@ -3196,6 +3197,9 @@ export class CodexClaudeAppServer {
             // distinct, repeatable handle. The collabAgentToolCall.model
             // field carries the actual SDK model the subagent runs on, NOT
             // the subagent_type — that distinction was wrong before.
+            //
+            // 昵称定下后不再改：桌面的标签页取子线程出现时的名字，列表行取之后读到的
+            // 名字，中途改名两处就对不上。CLI 给的代理 ID 另存，见 saveSubagentId。
             const promptText = String(event.input.prompt ?? event.input.description ?? '')
             const subType =
               typeof event.input.subagent_type === 'string' ? event.input.subagent_type : null
@@ -3228,7 +3232,9 @@ export class CodexClaudeAppServer {
               status: { type: 'active', activeFlags: [] },
               approvalPolicy: thread.approvalPolicy,
               sandboxMode: thread.sandboxMode,
-              ephemeral: true,
+              // 跟随父线程。桌面不把打开之后的实时更新应用到临时线程，子线程一律标成
+              // 临时会让运行中打开的子线程停在打开那一刻，状态一直是运行中。
+              ephemeral: thread.ephemeral,
               threadSource: 'subagent',
               agentRole,
               agentNickname,
@@ -3439,12 +3445,9 @@ export class CodexClaudeAppServer {
             const childThread = this.store.getThread(ctx.childThreadId)
             if (childThread) {
               childThread.updatedAt = nowSeconds()
-              // Replace our synthetic `agent-{hex}` nickname with the SDK-
-              // assigned id so SendMessage / SubAgent navigation in the App
-              // uses the same handle the SDK reports.
-              if (parsed.agentId) childThread.agentNickname = parsed.agentId
               this.store.upsertThread(childThread)
             }
+            if (parsed.agentId) this.saveSubagentId(ctx.childThreadId, parsed.agentId)
 
             // The child completion activity arrives before wait/completed in
             // native V2. The installed Codex cc schema predates the
@@ -5155,7 +5158,8 @@ export class CodexClaudeAppServer {
 
   private getConversationSummary(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.conversationId, '')
-    const thread = this.store.getThread(threadId) ?? this.store.listThreads({ limit: 1 }).at(0)
+    const thread =
+      this.store.getThread(threadId) ?? this.store.listThreads({ limit: 1, sourceKinds: [] }).at(0)
     const now = new Date().toISOString()
     return {
       summary: {
@@ -5632,7 +5636,7 @@ export class CodexClaudeAppServer {
   private subagentRelay(thread: ThreadRecord): { parent: ThreadRecord; agentId: string } | null {
     if (thread.threadSource !== 'subagent') return null
     const parent = thread.forkedFromId ? this.store.getThread(thread.forkedFromId) : null
-    const agentId = thread.agentNickname ?? ''
+    const agentId = this.store.threadSettings(thread.id).claudeAgentId ?? ''
     if (
       !parent?.claudeSessionId ||
       thread.agentRole === 'workflow' ||
@@ -5640,6 +5644,14 @@ export class CodexClaudeAppServer {
     )
       throw new ProtocolError(-32009, '这个子代理没有可恢复的记录，不能继续对话')
     return { parent, agentId }
+  }
+
+  // CLI 给子代理的 ID 只用于追问时寻址，与显示用的昵称分开保存。
+  private saveSubagentId(childThreadId: string, agentId: string): void {
+    const settings = this.store.threadSettings(childThreadId)
+    if (settings.claudeAgentId === agentId) return
+    settings.claudeAgentId = agentId
+    this.store.saveThreadSettings(childThreadId, settings)
   }
 
   private peerForParams(peer: RpcPeer, params: unknown): RpcPeer {

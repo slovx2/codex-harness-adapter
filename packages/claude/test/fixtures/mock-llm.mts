@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { createServer, type IncomingHttpHeaders, type ServerResponse } from 'node:http'
 import { saveArtifact } from './artifacts.mjs'
+import { reclaimAtEnd } from './reclaim.mjs'
 
 export type ModelRequest = Record<string, any>
 export type ModelReply =
@@ -19,6 +20,8 @@ export class MockLLM {
   readonly requests: ModelRequest[] = []
   readonly unexpected: string[] = []
   private steps: ModelStep[] = []
+  private reclaimed: (() => void) | undefined
+  private closing: Promise<void> | undefined
   private server = createServer(async (req, res) => {
     try {
       const chunks: Buffer[] = []
@@ -204,11 +207,17 @@ export class MockLLM {
   }
   async start(): Promise<string> {
     await new Promise<void>((resolve) => this.server.listen(0, '127.0.0.1', resolve))
+    this.reclaimed = reclaimAtEnd(() => this.close())
     const address = this.server.address()
     if (!address || typeof address === 'string') throw new Error('Mock LLM 地址无效')
     return `http://127.0.0.1:${address.port}`
   }
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    this.closing ??= this.shutdown()
+    return this.closing
+  }
+  private async shutdown(): Promise<void> {
+    this.reclaimed?.()
     await saveArtifact('model-requests', { requests: this.requests, unexpected: this.unexpected })
     this.server.closeAllConnections()
     await new Promise<void>((resolve, reject) =>

@@ -413,3 +413,214 @@ test('SUBAGENT-006：后台子代理运行期间中断，父子回合都结束�
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
   }
 })
+
+// 桌面端不把打开之后的实时更新应用到临时线程：子线程带着临时标记时，运行中打开只能看到
+// 打开那一刻的内容，摘要里一直是运行中。下面三个用例固定对应的协议行为。
+const childNotifications = (client: ProtocolClient, childId: string, from: number) =>
+  client.trace
+    .slice(from)
+    .filter((message) => message.method && message.params?.threadId === childId)
+
+test('SUBAGENT-007：运行中打开的子线程不是临时线程，之后的正文、结束与空闲状态照常送达', {
+  timeout: 120_000,
+}, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'native-subagent-open-'))
+  await writeFile(join(home, 'a.txt'), 'probe-file-content: 42\n')
+  const model = new MockLLM()
+  const client = await ProtocolClient.start(home, await model.start())
+  try {
+    const { thread } = await client.request('thread/start', {
+      cwd: home,
+      sandbox: 'danger-full-access',
+      approvalPolicy: 'never',
+    })
+    for (let index = 0; index < 5; index++) model.enqueue(subagentRouter(home, 'background', 2500))
+    const { turn } = await client.request('turn/start', {
+      threadId: thread.id,
+      input: [{ type: 'text', text: 'SUBAGENT_MAIN 请派子代理读取 a.txt' }],
+    })
+    const started = await client.notification(
+      'thread/started',
+      (params) => params.thread.id !== thread.id,
+    )
+    const childId = started.thread.id
+    assert.equal(started.thread.ephemeral, false, '子线程不能标成临时线程')
+    // 桌面在子代理运行中打开子线程时发的就是这个请求。
+    const opened = await client.request('thread/resume', { threadId: childId })
+    assert.equal(opened.thread.ephemeral, false)
+    assert.equal(opened.thread.status.type, 'active', '打开时子代理应仍在运行')
+    const openedAt = client.trace.length
+    assert.equal((await client.completed(turn.id)).status, 'completed')
+    const later = childNotifications(client, childId, openedAt)
+    assert.ok(
+      later.some(
+        (message) =>
+          message.method === 'item/completed' &&
+          message.params.item.type === 'agentMessage' &&
+          message.params.item.text === 'CHILD_DONE 文件内容是 probe-file-content: 42',
+      ),
+      '打开之后才写出的最后一段正文要以通知送达',
+    )
+    assert.ok(
+      later.some(
+        (message) =>
+          message.method === 'turn/completed' && message.params.turn.status === 'completed',
+      ),
+      '子线程回合结束要以通知送达',
+    )
+    assert.ok(
+      later.some(
+        (message) =>
+          message.method === 'thread/status/changed' && message.params.status.type === 'idle',
+      ),
+      '子线程变为空闲要以通知送达',
+    )
+    const child = (await client.request('thread/read', { threadId: childId, includeTurns: true }))
+      .thread
+    assert.equal(child.ephemeral, false)
+    assert.equal(child.status.type, 'idle')
+    const parent = (
+      await client.request('thread/read', { threadId: thread.id, includeTurns: true })
+    ).thread
+    const wait = parent.turns[0].items.find(
+      (item: any) => item.type === 'collabAgentToolCall' && item.tool === 'wait',
+    )
+    assert.equal(
+      wait.agentsStates[childId].status,
+      'completed',
+      '父线程里子代理的状态不能停在运行中',
+    )
+    model.assertConsumed()
+  } finally {
+    await client.close()
+    await model.close()
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+  }
+})
+
+test('SUBAGENT-008：追问的回答送到非临时的子线程，子线程的名字前后一致', {
+  timeout: 120_000,
+}, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'native-subagent-name-'))
+  await writeFile(join(home, 'a.txt'), 'probe-file-content: 42\n')
+  const model = new MockLLM()
+  const client = await ProtocolClient.start(home, await model.start())
+  try {
+    const { thread } = await client.request('thread/start', {
+      cwd: home,
+      sandbox: 'danger-full-access',
+      approvalPolicy: 'never',
+    })
+    for (let index = 0; index < 4; index++) model.enqueue(subagentRouter(home, 'foreground'))
+    const first = await client.request('turn/start', {
+      threadId: thread.id,
+      input: [{ type: 'text', text: 'SUBAGENT_MAIN 请派子代理读取 a.txt' }],
+    })
+    assert.equal((await client.completed(first.turn.id)).status, 'completed')
+    const started = await client.notification(
+      'thread/started',
+      (params) => params.thread.id !== thread.id,
+    )
+    const childId = started.thread.id
+    // 标签页用的是子线程出现时的名字，列表行用的是之后读到的名字，两处必须是同一个。
+    const nickname = started.thread.agentNickname
+    assert.match(nickname, /^agent-[0-9a-f]{12}$/)
+    const sameName = (value: any, where: string) => {
+      assert.equal(value.agentNickname, nickname, `${where}的昵称变了`)
+      assert.equal(value.source.subAgent.thread_spawn.agent_nickname, nickname, where)
+      assert.equal(value.ephemeral, false, `${where}被标成临时线程`)
+    }
+    sameName(
+      (await client.request('thread/read', { threadId: childId, includeTurns: false })).thread,
+      '结束后读取',
+    )
+    // 桌面在子线程回合结束后会重新恢复它。
+    sameName((await client.request('thread/resume', { threadId: childId })).thread, '恢复')
+    for (let index = 0; index < 4; index++) model.enqueue(subagentRouter(home, 'foreground'))
+    const askedAt = client.trace.length
+    const followUp = await client.request('turn/start', {
+      threadId: childId,
+      input: [{ type: 'text', text: 'CHILD_FOLLOWUP 刚才读到的数值是多少' }],
+    })
+    assert.equal((await client.completed(followUp.turn.id)).status, 'completed')
+    const later = childNotifications(client, childId, askedAt)
+    assert.ok(
+      later.some(
+        (message) =>
+          message.method === 'item/completed' &&
+          message.params.turnId === followUp.turn.id &&
+          message.params.item.type === 'agentMessage' &&
+          /^CHILD_FOLLOWUP_ANSWER /.test(message.params.item.text),
+      ),
+      '追问的回答要以通知送到子线程',
+    )
+    sameName(
+      (await client.request('thread/read', { threadId: childId, includeTurns: false })).thread,
+      '追问后读取',
+    )
+    const listed = await client.request('thread/list', {
+      parentThreadId: thread.id,
+      sourceKinds: ['subAgentThreadSpawn'],
+    })
+    assert.deepEqual(
+      listed.data.map((item: any) => item.id),
+      [childId],
+    )
+    sameName(listed.data[0], '列表')
+    model.assertConsumed()
+  } finally {
+    await client.close()
+    await model.close()
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+  }
+})
+
+test('SUBAGENT-009：默认线程列表不含子线程，按父线程、祖先或来源才查得到', {
+  timeout: 120_000,
+}, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'native-subagent-list-'))
+  await writeFile(join(home, 'a.txt'), 'probe-file-content: 42\n')
+  const model = new MockLLM()
+  const client = await ProtocolClient.start(home, await model.start())
+  try {
+    const { thread } = await client.request('thread/start', {
+      cwd: home,
+      sandbox: 'danger-full-access',
+      approvalPolicy: 'never',
+    })
+    for (let index = 0; index < 4; index++) model.enqueue(subagentRouter(home, 'foreground'))
+    const { turn } = await client.request('turn/start', {
+      threadId: thread.id,
+      input: [{ type: 'text', text: 'SUBAGENT_MAIN 请派子代理读取 a.txt' }],
+    })
+    assert.equal((await client.completed(turn.id)).status, 'completed')
+    const [child] = await childThreads(client, thread.id)
+    assert.ok(child, '应创建子线程')
+    const ids = async (params: Record<string, unknown>) =>
+      (await client.request('thread/list', params)).data.map((item: any) => item.id)
+    // 与 Codex 原生一致：不指定来源或来源为空时只列用户自己的线程。
+    assert.deepEqual(await ids({}), [thread.id])
+    assert.deepEqual(await ids({ sourceKinds: [], archived: false, modelProviders: null }), [
+      thread.id,
+    ])
+    // 桌面查子代理时固定带来源，按父线程或祖先线程查。
+    const spawn = ['subAgentThreadSpawn']
+    assert.deepEqual(await ids({ parentThreadId: thread.id, sourceKinds: spawn }), [child.id])
+    assert.deepEqual(await ids({ ancestorThreadId: thread.id, sourceKinds: spawn }), [child.id])
+    assert.deepEqual(await ids({ sourceKinds: spawn }), [child.id])
+    // 按关系查且不指定来源时不限来源；来源给了空数组则仍只列用户自己的线程。
+    assert.deepEqual(await ids({ parentThreadId: thread.id }), [child.id])
+    assert.deepEqual(await ids({ parentThreadId: thread.id, sourceKinds: [] }), [])
+    const both = await client.raw(
+      'thread/list',
+      { parentThreadId: thread.id, ancestorThreadId: thread.id },
+      -32600,
+    )
+    assert.match(both.error.message, /parentThreadId/)
+    model.assertConsumed()
+  } finally {
+    await client.close()
+    await model.close()
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+  }
+})

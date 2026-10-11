@@ -42,6 +42,7 @@ if (!process.env.ANTHROPIC_BETAS) {
 
 import type { OnElicitation, Query } from '@anthropic-ai/claude-agent-sdk'
 import { type ApprovalPolicy, allowsApproval, toolApprovalFlow } from './approval-policy.mjs'
+import { cliOutputFormat } from './cli-output-schema.mjs'
 import { dynamicToolServer } from './dynamic-tools.mjs'
 import { goalToolServer, isGoalTool } from './goal-tools.mjs'
 import { hostClaudeExecutable } from './host-claude.mjs'
@@ -660,7 +661,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (context.addDirs && context.addDirs.length > 0) opts.additionalDirectories = context.addDirs
     if (context.allowedTools && context.allowedTools.length > 0)
       opts.allowedTools = context.allowedTools
-    if (context.outputFormat) opts.outputFormat = context.outputFormat
+    if (context.outputFormat) opts.outputFormat = cliOutputFormat(context.outputFormat)
 
     // 完全访问由回调授权，支持 root 部署且保留计划确认和用户提问。
     const mode = derivePermissionMode(context.planMode)

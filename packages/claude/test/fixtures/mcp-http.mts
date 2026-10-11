@@ -2,6 +2,7 @@ import { createServer } from 'node:http'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
+import { reclaimAtEnd } from './reclaim.mjs'
 
 export class LocalMcp {
   calls = 0
@@ -10,6 +11,8 @@ export class LocalMcp {
     this.call = privateCall
   }
   private call: () => Promise<void>
+  private reclaimed: (() => void) | undefined
+  private closing: Promise<void> | undefined
   private server = createServer(async (req, res) => {
     if (
       req.headers.authorization !== 'Bearer test-not-a-secret' ||
@@ -55,11 +58,17 @@ export class LocalMcp {
   })
   async start(): Promise<string> {
     await new Promise<void>((resolve) => this.server.listen(0, '127.0.0.1', resolve))
+    this.reclaimed = reclaimAtEnd(() => this.close())
     const address = this.server.address()
     if (!address || typeof address === 'string') throw new Error('MCP 地址无效')
     return `http://127.0.0.1:${address.port}/mcp`
   }
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    this.closing ??= this.shutdown()
+    return this.closing
+  }
+  private async shutdown(): Promise<void> {
+    this.reclaimed?.()
     this.server.closeAllConnections()
     await new Promise<void>((resolve, reject) =>
       this.server.close((error) => (error ? reject(error) : resolve())),

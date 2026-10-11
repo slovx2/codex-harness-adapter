@@ -32,7 +32,7 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | --- | --- | --- |
 | Model mapping | Supported | Native Claude aliases pass through; unknown Codex/OpenAI ids fall back to the default model. App model/effort selections are remembered and echoed via `config/read`. |
 | Reasoning effort | Best effort | Codex efforts normalized, mappable via `CHA_CLAUDE_EFFORT_ALIASES`; older SDKs may ignore unsupported options. |
-| Structured title/summary turns | Supported (fallback) | Codex internal model ids (e.g. gpt-5.4-mini) map to `CHA_CLAUDE_SUMMARY_MODEL` (default haiku) when an outputSchema is present; falls back to schema-shaped JSON if Claude emits plain text. |
+| Structured title/summary turns | Supported (fallback) | Codex internal model ids (e.g. gpt-5.4-mini) map to `CHA_CLAUDE_SUMMARY_MODEL` (default haiku) when an outputSchema is present; falls back to schema-shaped JSON if Claude emits plain text. Claude CLI 用 draft-07 严格模式校验输出格式：声明 2019-09 / 2020-12 的模式在交给 CLI 前换成等价写法（去掉 `$schema`，`prefixItems`/`items` 换成 `items`/`additionalItems`，`dependentRequired`/`dependentSchemas` 并入 `dependencies`）；没有等价写法的约束、自定义关键字和其他草案直接让回合报错并说明原因，结果仍按原模式校验（OUTPUT-SCHEMA-001…006）。 |
 | SDK option compatibility | Supported | When an older SDK rejects an option, the sidecar drops it one at a time (least essential first) and emits an info notice. |
 
 ## Tools, approvals & events
@@ -45,10 +45,11 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | File edit approval | Supported | Edit/Write/MultiEdit → Codex fileChange items with approval + diff updates. |
 | Bash output | Supported | Forwarded as command output on completion (SDK has no incremental tool-output streaming). |
 | Generic Claude tools | Supported | Non-command/file tools → mcpToolCall items under the `claude-code` pseudo server. |
-| Subagent (Task) | Supported | Task spawns an ephemeral child thread and emits native `subAgentActivity` lifecycle events (capability-gated `completed`) plus `spawnAgent`/`wait` tool state. 子代理的正文、思考与工具调用投影为子线程自己的条目，最后一段正文即结果（不再另写一条）；结果取 SDK 的结构化工具结果，不含 CLI 的内部包装文字。 |
+| Subagent (Task) | Supported | Task spawns a child thread and emits native `subAgentActivity` lifecycle events (capability-gated `completed`) plus `spawnAgent`/`wait` tool state. 子代理的正文、思考与工具调用投影为子线程自己的条目，最后一段正文即结果（不再另写一条）；结果取 SDK 的结构化工具结果，不含 CLI 的内部包装文字。子线程跟随父线程的 `ephemeral`（普通会话下为 false，桌面才会把打开之后的更新显示出来）；昵称 `agent-{12hex}` 创建后不变，CLI 的代理 ID 另存，只用于追问寻址。 |
 | 后台子代理 | Supported | CLI 默认把子代理放到后台：启动回执不当作结果，主回合照常继续；回合在 CLI 上报会话空闲后才结束，子代理的真实结果在此之前送达父线程与子线程。后台 Bash 不在等待范围内，仍随每回合的 CLI 进程结束。 |
 | 子线程追问 | Supported (中转) | 在已结束的子代理子线程里发消息：适配器恢复父会话，由主模型调用 `SendMessage` 把用户原文转给该子代理（钩子写定收件人与正文，并拒绝其他工具），子代理带着此前的上下文继续，输出显示在子线程，父线程不新增回合。每次追问占用父会话一个隐藏回合；父回合进行中、Workflow 子代理或没有可恢复记录时拒绝（`-32009`），追问进行中父线程不能开新回合，追问回合内的追加输入（`turn/steer`）同样拒绝。被恢复的子代理再派出的子代理不单独显示。 |
-| Ephemeral / threadSource | Supported | `ephemeral: true` threads (title-gen, memory-consolidation, subagents) persist but are excluded from `thread/list` unless `includeEphemeral: true`. `threadSource` round-trips. |
+| Ephemeral / threadSource | Supported | `ephemeral: true` threads (title-gen, memory-consolidation) persist but are excluded from `thread/list` unless `includeEphemeral: true`. `threadSource` round-trips. |
+| 子线程的列表行为 | Supported | 与 Codex 0.157.1 一致：`thread/list` 不指定来源或来源为空时不返回子代理线程；带 `sourceKinds: ["subAgent" \| "subAgentThreadSpawn"]`，或按 `parentThreadId` / `ancestorThreadId` 查且不指定来源时返回。两个关系参数同时给出报 -32600。与原生的差别：关系按 `forkedFromId` 判断，不指定来源时用户分叉出的线程也会返回。 |
 | Claude side events | Supported | rate_limit / hook / subagent / compaction events summarized into structured notice lines. |
 | Review mode | Supported (text) | `review/start` creates an in-progress review turn and routes the prompt through Claude. No native guardian finding items. |
 | Context compaction | Supported (summary) | `thread/compact/start` routes the summary prompt and emits contextCompaction items. No native persisted rollout compaction. |

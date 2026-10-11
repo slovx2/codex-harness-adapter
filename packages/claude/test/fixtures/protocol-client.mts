@@ -4,6 +4,8 @@ import { dirname, join, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
 import { saveArtifact } from './artifacts.mjs'
+import { configuredClaudeCli, requireClaudeCliFor, requiredClaudeCli } from './claude-cli.mjs'
+import { reclaimAtEnd } from './reclaim.mjs'
 import { validatePayload } from './schema-contract.mjs'
 
 export class ProtocolClient {
@@ -14,6 +16,8 @@ export class ProtocolClient {
   private protocolErrors: Error[] = []
   readonly process: ChildProcessWithoutNullStreams
   private readonly transportClosed: Promise<void>
+  private readonly reclaimed: () => void
+  private closing: Promise<void> | undefined
   private expectedCloseSignal: NodeJS.Signals | undefined
   private sequence = 0
   private pending = new Map<
@@ -34,6 +38,7 @@ export class ProtocolClient {
     )
       throw new Error('协议测试只能连接回环 Mock LLM')
     this.modelEndpoint = endpoint.origin
+    const cli = mock ? configuredClaudeCli() : requiredClaudeCli()
     // 白名单环境，不能继承个人模型凭据、代理或 Claude 配置。
     const env = {
       PATH: `${dirname(process.execPath)}:/usr/bin:/bin`,
@@ -42,7 +47,7 @@ export class ProtocolClient {
       CODEX_HOME: join(home, 'codex'),
       CHA_CLAUDE_HOME: join(home, 'adapter'),
       CLAUDE_CONFIG_DIR: join(home, 'claude'),
-      CHA_CLAUDE_CLI: process.env.CHA_CLAUDE_CLI,
+      CHA_CLAUDE_CLI: cli,
       ...(auth === 'oauth'
         ? { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-test-not-a-secret' }
         : { ANTHROPIC_API_KEY: 'test-not-a-secret' }),
@@ -63,6 +68,7 @@ export class ProtocolClient {
       [fileURLToPath(new URL('../../src/adapter.mjs', import.meta.url)), 'app-server'],
       { env },
     )
+    this.reclaimed = reclaimAtEnd(() => this.close())
     this.transportClosed = new Promise((resolve) => {
       this.process.once('close', (exitCode, signal) => {
         this.trace.push({
@@ -130,6 +136,7 @@ export class ProtocolClient {
     mock = false,
     auth: 'api-key' | 'oauth' = 'api-key',
   ): Promise<ProtocolClient> {
+    if (!mock) await requireClaudeCliFor(home)
     await mkdir(join(home, 'claude'), { recursive: true })
     const client = new ProtocolClient(home, baseURL, mock, auth)
     try {
@@ -216,11 +223,23 @@ export class ProtocolClient {
     this.expectedCloseSignal = 'SIGKILL'
     if (!this.process.kill('SIGKILL')) throw new Error('无法注入适配器进程崩溃')
   }
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    this.closing ??= this.shutdown()
+    return this.closing
+  }
+  private async shutdown(): Promise<void> {
+    this.reclaimed()
+    let forced = false
     if (this.process.exitCode === null && this.process.signalCode === null) {
       this.process.kill('SIGTERM')
     }
+    // 收尾必须有界：适配器不响应时强制结束，并让用例失败，而不是让测试文件挂住。
+    const escalate = setTimeout(() => {
+      forced = true
+      this.process.kill('SIGKILL')
+    }, 15_000)
     await this.transportClosed
+    clearTimeout(escalate)
     // CLI 将部分连接错误写入配置目录，stderr 可能为空；只读本用例的临时目录。
     const debugDirectory = join(this.home, 'claude', 'debug')
     const debugFiles = await readdir(debugDirectory, { withFileTypes: true }).catch(() => [])
@@ -239,6 +258,7 @@ export class ProtocolClient {
       messages: this.trace,
       protocolErrors: this.protocolErrors.map((error) => error.message),
     })
+    if (forced) throw new Error(`适配器 15 秒内没有响应 SIGTERM，已强制结束: ${this.stderr}`)
   }
   private redactDiagnostics(value: string): string {
     return value

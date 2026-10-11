@@ -3494,13 +3494,14 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
     const childRead = await reader.nextResponse(5)
     const childThread = childRead.result.thread
     assert.equal(childThread.threadSource, 'subagent')
-    assert.equal(childThread.ephemeral, true)
+    // 子线程跟随父线程，不再一律标成临时线程。
+    assert.equal(childThread.ephemeral, false)
     assert.equal(childThread.agentRole, 'general-purpose')
     // The Task tool_result carried an `agentId: deadbeefcafef00d` trailer
-    // (mock mirrors the real claude-agent-sdk format). The server should
-    // strip it from the visible text and overwrite the synthetic
-    // `agent-{hex}` nickname with the SDK-assigned id.
-    assert.equal(childThread.agentNickname, 'deadbeefcafef00d')
+    // (mock mirrors the real claude-agent-sdk format). The server strips it
+    // from the visible text; 昵称保持子线程出现时的那个，不换成代理 ID。
+    assert.match(childThread.agentNickname, /^agent-[0-9a-f]{12}$/)
+    assert.equal(childThread.agentNickname, childThreadStarted.agentNickname)
     assert.equal(
       childThread.forkedFromId,
       threadId,
@@ -3562,7 +3563,7 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
       'main agent text after subagent should still appear',
     )
 
-    // Ephemeral child thread is hidden from the default list, exposed with includeEphemeral.
+    // 子线程的来源是 subAgent，不进普通列表；includeEphemeral 只管临时线程，与它无关。
     proc.stdin.write(json({ id: 3, method: 'thread/list', params: {} }))
     const list = await reader.nextResponse(3)
     const ids = (list.result.data as any[]).map((t) => t.id)
@@ -3576,8 +3577,8 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
     const listAll = await reader.nextResponse(4)
     const allIds = (listAll.result.data as any[]).map((t) => t.id)
     assert.ok(
-      allIds.includes(childThreadId),
-      'includeEphemeral=true should surface the subagent child thread',
+      !allIds.includes(childThreadId),
+      'includeEphemeral=true must not turn the subagent child into a regular thread',
     )
 
     // Codex App discovers subagents after reconnect through the standard

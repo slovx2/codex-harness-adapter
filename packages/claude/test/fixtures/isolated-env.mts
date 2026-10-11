@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { configuredClaudeCli } from './claude-cli.mjs'
 
 // 被测进程不继承个人环境：只保留运行必需的变量，主目录指向空的临时位置。
 // 否则本机的用户级 MCP 服务、模型凭据和代理会进入被测进程，结果随机器而变。
@@ -22,8 +23,6 @@ const inherited = [
   'SystemRoot',
   'ComSpec',
   'PATHEXT',
-  // 真实 SDK 用例需要的隔离 CLI，由运行测试的人显式指定。
-  'CHA_CLAUDE_CLI',
 ]
 
 export const isolatedEnv: NodeJS.ProcessEnv = {
@@ -34,4 +33,7 @@ export const isolatedEnv: NodeJS.ProcessEnv = {
   ),
   HOME: root,
   USERPROFILE: root,
+  // 真实 SDK 用例需要的隔离 CLI，由运行测试的人显式指定；没指定时给一个不存在的路径，
+  // 被测进程不会顺着 PATH 找到开发者自己的 claude。
+  CHA_CLAUDE_CLI: configuredClaudeCli(),
 }

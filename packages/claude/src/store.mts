@@ -338,7 +338,7 @@ export class SessionStore {
       includeEphemeral?: boolean
       parentThreadId?: string | null
       ancestorThreadId?: string | null
-      sourceKinds?: string[]
+      sourceKinds?: string[] | undefined
       sectionId?: string | null | undefined
       projectId?: string | null | undefined
       sortKey?: 'created_at' | 'updated_at' | 'recency_at' | 'section_position'
@@ -396,7 +396,8 @@ export class SessionStore {
     }
     const parentThreadId = options.parentThreadId ?? null
     const ancestorThreadId = options.ancestorThreadId ?? null
-    const sourceKinds = options.sourceKinds ?? []
+    // 不传来源表示不按来源过滤；传空数组表示只列用户自己的线程（见下）。
+    const sourceKinds = options.sourceKinds ?? null
 
     if (parentThreadId != null) {
       where.push('t.forked_from_id = ?')
@@ -406,7 +407,11 @@ export class SessionStore {
       where.push('t.id IN (SELECT id FROM descendants)')
     }
 
-    if (sourceKinds.length > 0) {
+    if (sourceKinds?.length === 0) {
+      // 子代理线程的来源是 subAgent，不算用户自己的线程：只在按来源查，或按父线程、
+      // 祖先线程查且不指定来源时返回。与 Codex 原生对空来源的处理一致。
+      where.push("(t.thread_source IS NOT 'subagent' OR t.forked_from_id IS NULL)")
+    } else if (sourceKinds) {
       const predicates = sourceKinds.flatMap((kind) => {
         switch (kind) {
           case 'subAgent':
@@ -436,11 +441,12 @@ export class SessionStore {
       where.push(predicates.length > 0 ? `(${predicates.join(' OR ')})` : '1 = 0')
     }
 
-    // Ephemeral threads (Codex App's internal title generators, subagent
-    // children, memory-consolidation runs) shouldn't appear in the user's
-    // session list. Topology queries are the exception: Codex App asks for
-    // subagent descendants without sending our legacy includeEphemeral flag.
-    const hasSubagentSourceFilter = sourceKinds.some((kind) =>
+    // Ephemeral threads (Codex App's internal title generators,
+    // memory-consolidation runs) shouldn't appear in the user's session list.
+    // Topology queries are the exception: a subagent child carries its
+    // parent's flag, and Codex App asks for subagent descendants without
+    // sending our legacy includeEphemeral flag.
+    const hasSubagentSourceFilter = (sourceKinds ?? []).some((kind) =>
       ['subAgent', 'subAgentThreadSpawn'].includes(kind),
     )
     const topologyQuery =

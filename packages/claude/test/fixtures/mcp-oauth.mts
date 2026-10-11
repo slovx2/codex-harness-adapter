@@ -13,6 +13,8 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import WebSocket from 'ws'
 import { saveArtifact } from './artifacts.mjs'
+import { requireClaudeCliFor, requiredClaudeCli } from './claude-cli.mjs'
+import { reclaimAtEnd } from './reclaim.mjs'
 import { validatePayload } from './schema-contract.mjs'
 
 const json = (res: ServerResponse, value: unknown, status = 200) =>
@@ -53,6 +55,7 @@ export class OAuthMcpFixture {
   private readonly mode: 'http' | 'sse'
   private readonly sse = new Map<string, SSEServerTransport>()
   private tokenGate: { started(): void; released: Promise<void> } | undefined
+  private reclaimed: (() => void) | undefined
 
   constructor(file: string, mode: 'http' | 'sse' = 'http') {
     this.file = file
@@ -74,6 +77,7 @@ export class OAuthMcpFixture {
   }
 
   async start(): Promise<string> {
+    this.reclaimed = reclaimAtEnd(() => this.close())
     this.issuer = await listen(this.authServer)
     this.url = (await listen(this.mcpServer)) + (this.mode === 'sse' ? '/sse' : '/mcp')
     return this.url
@@ -98,6 +102,7 @@ export class OAuthMcpFixture {
   }
 
   async close(): Promise<void> {
+    this.reclaimed?.()
     for (const transport of this.sse.values()) await transport.close()
     this.sse.clear()
     for (const server of [this.authServer, this.mcpServer]) {
@@ -282,6 +287,8 @@ export class OAuthDaemonFixture {
   private sequence = 0
   private ws: WebSocket | undefined
   private readonly protocolErrors: string[] = []
+  private readonly reclaimed: () => void
+  private closing: Promise<void> | undefined
 
   constructor(home: string, endpoint: string, address: string) {
     assert.equal(new URL(endpoint).hostname, '127.0.0.1')
@@ -297,7 +304,7 @@ export class OAuthDaemonFixture {
           CODEX_HOME: join(home, 'codex'),
           CHA_CLAUDE_HOME: join(home, 'adapter'),
           CLAUDE_CONFIG_DIR: join(home, 'claude'),
-          CHA_CLAUDE_CLI: process.env.CHA_CLAUDE_CLI,
+          CHA_CLAUDE_CLI: requiredClaudeCli(),
           ANTHROPIC_API_KEY: 'test-not-a-secret',
           ANTHROPIC_BASE_URL: endpoint,
           CHA_CLAUDE_RUNTIME: 'agent-sdk-sidecar',
@@ -315,9 +322,11 @@ export class OAuthDaemonFixture {
     this.process.stdout.resume()
     this.process.stderr.resume()
     this.exited = once(this.process, 'close')
+    this.reclaimed = reclaimAtEnd(() => this.close())
   }
 
   static async start(home: string, endpoint: string): Promise<OAuthDaemonFixture> {
+    await requireClaudeCliFor(home)
     await mkdir(join(home, 'claude'), { recursive: true })
     const reserve = createServer()
     const address = (await listen(reserve)).replace('http:', 'ws:')
@@ -403,12 +412,26 @@ export class OAuthDaemonFixture {
     this.ws = undefined
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    this.closing ??= this.shutdown()
+    return this.closing
+  }
+
+  private async shutdown(): Promise<void> {
+    this.reclaimed()
     await this.disconnect()
+    let forced = false
     if (this.process.exitCode === null && this.process.signalCode === null)
       this.process.kill('SIGTERM')
+    // 与 ProtocolClient 相同：收尾有界，不响应就强制结束并让用例失败。
+    const escalate = setTimeout(() => {
+      forced = true
+      this.process.kill('SIGKILL')
+    }, 15_000)
     await this.exited
+    clearTimeout(escalate)
     await saveArtifact('wire', { messages: this.trace, protocolErrors: this.protocolErrors })
     assert.deepEqual(this.protocolErrors, [])
+    assert.equal(forced, false, '守护进程 15 秒内没有响应 SIGTERM，已强制结束')
   }
 }

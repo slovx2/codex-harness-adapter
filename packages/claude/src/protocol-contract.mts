@@ -18,6 +18,8 @@ export interface ThreadRuntimeSettings {
   dynamicTools?: unknown[]
   config?: Record<string, unknown>
   gitInfo?: { sha: string | null; branch: string | null; originUrl: string | null } | null
+  // 子代理线程：CLI 给这个子代理的 ID，追问时按它寻址。
+  claudeAgentId?: string
 }
 
 export function rejectForeignModel(model: unknown): void {

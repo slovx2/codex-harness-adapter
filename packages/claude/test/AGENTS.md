@@ -30,3 +30,11 @@ node --test packages/claude/dist/claude/test/adapter.test.mjs   # a single suite
   `npm test` 另用 `--import` 预加载 `fixtures/isolate-process.mts`，测试进程自身的主目录也是空的临时目录；
   直接用 `node --test` 跑单个文件时没有这层预加载。
 - 等待被测进程输出必须有超时（`adapter.test.mts` 的读取器默认 60 秒），出问题要失败，不能无限挂起。
+- 真实 CLI 用例只用 `CHA_CLAUDE_CLI` 指定的隔离 CLI，规则集中在 `fixtures/claude-cli.mts`。没设置时不跳过，
+  也不改用 PATH 里的 `claude`：`ProtocolClient`（非 mock）和 `OAuthDaemonFixture` 立即抛错并说明原因；
+  `isolatedEnv` 与 `isolate-process` 把它设成一个不存在的路径，被测进程和进程内解析 CLI 路径的用例会报“未找到”。
+  新增会启动适配器的夹具时用 `requiredClaudeCli()` / `configuredClaudeCli()`，不要直接透传 `process.env.CHA_CLAUDE_CLI`。
+- 会启动进程或监听端口的夹具要用 `fixtures/reclaim.mts` 的 `reclaimAtEnd` 登记收尾，`close()` 要能重复调用且有时限。
+  用例超时或在进入 `try` 之前失败时自己的 `finally` 不会执行，留下的进程和端口会让测试文件一直不退出。
+  `npm test` 另带 `--test-force-exit`：用例都结束后先执行上面登记的收尾，再退出进程，用例里自己建的
+  监听端口不会再把文件挂住。直接用 `node --test` 跑单个文件时建议也带上（`test-harness.test.mts` 固定了这几种情形）。

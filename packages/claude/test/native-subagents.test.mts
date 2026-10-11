@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -10,8 +10,20 @@ import { ProtocolClient } from './fixtures/protocol-client.mjs'
 const toolId = () => `toolu_${randomUUID().replace(/-/g, '').slice(0, 20)}`
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
+// 追问回合里有两件事在同一个 CLI 进程里并发：被恢复的子代理作答，父会话带着 SendMessage 的工具结果
+// 发下一次请求。子代理先结束，它的结束通知就随工具结果并进父会话的这次请求，整个回合 3 次模型请求；
+// 父会话的请求先发出，通知另起一轮，共 4 次。先后由 CLI 内部时序决定，慢机器上两种都会出现，
+// 所以追问回合的应答不能按固定次数排，要由用例把先后定下来。
+type FollowUpOrder = 'parent-first' | 'child-first'
+type FollowUp = { order: FollowUpOrder; parentAsked: () => void; afterParentAsked: Promise<void> }
+
 // 父子请求可能交错到达，按请求内容路由而不是按到达顺序。
-function subagentRouter(home: string, mode: 'background' | 'foreground', subDelayMs = 0) {
+function subagentRouter(
+  home: string,
+  mode: 'background' | 'foreground',
+  subDelayMs = 0,
+  followUp?: FollowUp,
+) {
   return async (request: ModelRequest) => {
     const messages = (request.messages ?? []) as Array<Record<string, any>>
     const first = JSON.stringify(messages[0]?.content ?? '')
@@ -49,8 +61,24 @@ function subagentRouter(home: string, mode: 'background' | 'foreground', subDela
             input: { to: 'someone-else', message: 'PARAPHRASED_BY_MODEL' },
           },
         ]
-      if (tailText.includes('task-notification'))
+      const notified = tailText.includes('task-notification')
+      if (followUp && tailHasToolResult) {
+        // 父会话拿到 SendMessage 的工具结果之后的收尾请求。
+        if (followUp.order === 'parent-first') {
+          if (notified)
+            throw new Error('子代理的回答还没放行，结束通知不该出现在父会话的收尾请求里')
+          followUp.parentAsked()
+          return [{ type: 'text', text: 'MAIN_AFTER_TOOL_RESULT' }]
+        }
+        if (!notified)
+          throw new Error('父会话发出收尾请求时子代理还没结束：钩子拖住父会话的时间不够')
         return [{ type: 'text', text: 'MAIN_AFTER_NOTIFICATION' }]
+      }
+      if (notified) {
+        if (followUp?.order === 'child-first')
+          throw new Error('结束通知已随工具结果送达，不该再另起一轮')
+        return [{ type: 'text', text: 'MAIN_AFTER_NOTIFICATION' }]
+      }
       if (tailHasToolResult) return [{ type: 'text', text: 'MAIN_AFTER_TOOL_RESULT' }]
       throw new Error('父会话收到未预期的请求')
     }
@@ -67,6 +95,8 @@ function subagentRouter(home: string, mode: 'background' | 'foreground', subDela
         ]
       if (tailText.includes('CHILD_FOLLOWUP')) {
         if (tailText.includes('PARAPHRASED_BY_MODEL')) throw new Error('子代理收到的不是用户原文')
+        // 回答扣到父会话的收尾请求发出之后，结束通知只能另起一轮。
+        if (followUp?.order === 'parent-first') await followUp.afterParentAsked
         return [{ type: 'text', text: `CHILD_FOLLOWUP_ANSWER 此前共 ${messages.length} 条消息` }]
       }
       if (subDelayMs) await sleep(subDelayMs)
@@ -74,6 +104,48 @@ function subagentRouter(home: string, mode: 'background' | 'foreground', subDela
     }
     throw new Error('收到无法归属的模型请求')
   }
+}
+
+// 按指定的先后排好追问回合的应答。parent-first：转交、子代理作答、父会话收尾、通知触发的续跑；
+// child-first：转交、子代理作答、带着结束通知的父会话收尾。
+function enqueueFollowUp(model: MockLLM, home: string, order: FollowUpOrder): void {
+  let parentAsked!: () => void
+  const afterParentAsked = new Promise<void>((resolve) => {
+    parentAsked = resolve
+  })
+  const followUp: FollowUp = { order, parentAsked, afterParentAsked }
+  for (let index = 0; index < (order === 'parent-first' ? 4 : 3); index++)
+    model.enqueue(subagentRouter(home, 'foreground', 0, followUp))
+}
+
+// child-first 用：SendMessage 返回后先执行这个钩子，父会话晚几秒才发下一次请求，
+// 被恢复的子代理在这期间答完并结束。
+async function holdParentAfterSendMessage(home: string, seconds: number): Promise<void> {
+  await mkdir(join(home, '.claude'), { recursive: true })
+  await writeFile(
+    join(home, '.claude', 'settings.json'),
+    JSON.stringify({
+      hooks: {
+        PostToolUse: [
+          {
+            matcher: 'SendMessage',
+            hooks: [{ type: 'command', command: `sleep ${seconds}`, timeout: 30 }],
+          },
+        ],
+      },
+    }),
+  )
+}
+
+// 回合没有完成时，把它的错误和模型端记下的意外请求带进失败信息。
+async function assertCompleted(client: ProtocolClient, model: MockLLM, turnId: string) {
+  const turn = await client.completed(turnId)
+  assert.equal(
+    turn.status,
+    'completed',
+    JSON.stringify({ error: turn.error, unexpectedModelRequests: model.unexpected }),
+  )
+  return turn
 }
 
 async function childThreads(client: ProtocolClient, parentId: string) {
@@ -262,8 +334,7 @@ test('SUBAGENT-004：在子线程追问会带着子代理原有上下文继续',
     const [child] = await childThreads(client, thread.id)
     assert.ok(child, '应创建子线程')
     await client.request('thread/resume', { threadId: child.id })
-    // 转交、转交后的收尾、子代理作答、子代理结束后父会话的续跑。
-    for (let index = 0; index < 4; index++) model.enqueue(subagentRouter(home, 'foreground'))
+    enqueueFollowUp(model, home, 'parent-first')
     const followUp = await client.request('turn/start', {
       threadId: child.id,
       input: [{ type: 'text', text: 'CHILD_FOLLOWUP 刚才读到的数值是多少' }],
@@ -279,7 +350,9 @@ test('SUBAGENT-004：在子线程追问会带着子代理原有上下文继续',
       -32009,
     )
     assert.match(steer.error.message, /追问/)
-    assert.equal((await client.completed(followUp.turn.id)).status, 'completed')
+    await assertCompleted(client, model, followUp.turn.id)
+    // 追问回合自己的应答必须正好用完，剩下的会被父线程下一回合的请求吃掉。
+    model.assertConsumed()
     const after = (await client.request('thread/read', { threadId: child.id, includeTurns: true }))
       .thread
     assert.equal(after.turns.length, 2)
@@ -301,7 +374,7 @@ test('SUBAGENT-004：在子线程追问会带着子代理原有上下文继续',
       threadId: thread.id,
       input: [{ type: 'text', text: '继续主任务' }],
     })
-    assert.equal((await client.completed(next.turn.id)).status, 'completed')
+    await assertCompleted(client, model, next.turn.id)
     assert.ok(
       JSON.stringify(model.requests.at(-1)?.messages).includes('CHILD_FOLLOWUP_ANSWER'),
       '父会话应知道子代理追问的结果',
@@ -536,13 +609,13 @@ test('SUBAGENT-008：追问的回答送到非临时的子线程，子线程的�
     )
     // 桌面在子线程回合结束后会重新恢复它。
     sameName((await client.request('thread/resume', { threadId: childId })).thread, '恢复')
-    for (let index = 0; index < 4; index++) model.enqueue(subagentRouter(home, 'foreground'))
+    enqueueFollowUp(model, home, 'parent-first')
     const askedAt = client.trace.length
     const followUp = await client.request('turn/start', {
       threadId: childId,
       input: [{ type: 'text', text: 'CHILD_FOLLOWUP 刚才读到的数值是多少' }],
     })
-    assert.equal((await client.completed(followUp.turn.id)).status, 'completed')
+    await assertCompleted(client, model, followUp.turn.id)
     const later = childNotifications(client, childId, askedAt)
     assert.ok(
       later.some(
@@ -617,6 +690,75 @@ test('SUBAGENT-009：默认线程列表不含子线程，按父线程、祖先�
       -32600,
     )
     assert.match(both.error.message, /parentThreadId/)
+    model.assertConsumed()
+  } finally {
+    await client.close()
+    await model.close()
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+  }
+})
+
+// 慢机器上被恢复的子代理会先于父会话的收尾请求结束：结束通知不再另起一轮，而是随 SendMessage 的
+// 工具结果一起送到父会话，整个追问回合少一次模型请求。结果必须与另一种先后（SUBAGENT-004）相同。
+test('SUBAGENT-011：子代理先于父会话收尾结束时，追问照常完成，父线程可继续', {
+  timeout: 120_000,
+}, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'native-subagent-fold-'))
+  await writeFile(join(home, 'a.txt'), 'probe-file-content: 42\n')
+  await holdParentAfterSendMessage(home, 2)
+  const model = new MockLLM()
+  const client = await ProtocolClient.start(home, await model.start())
+  try {
+    const { thread } = await client.request('thread/start', {
+      cwd: home,
+      sandbox: 'danger-full-access',
+      approvalPolicy: 'never',
+    })
+    for (let index = 0; index < 4; index++) model.enqueue(subagentRouter(home, 'foreground'))
+    const first = await client.request('turn/start', {
+      threadId: thread.id,
+      input: [{ type: 'text', text: 'SUBAGENT_MAIN 请派子代理读取 a.txt' }],
+    })
+    await assertCompleted(client, model, first.turn.id)
+    const [child] = await childThreads(client, thread.id)
+    assert.ok(child, '应创建子线程')
+    await client.request('thread/resume', { threadId: child.id })
+    const before = model.requests.length
+    enqueueFollowUp(model, home, 'child-first')
+    const followUp = await client.request('turn/start', {
+      threadId: child.id,
+      input: [{ type: 'text', text: 'CHILD_FOLLOWUP 刚才读到的数值是多少' }],
+    })
+    await assertCompleted(client, model, followUp.turn.id)
+    model.assertConsumed()
+    assert.equal(model.requests.length - before, 3, '结束通知随工具结果送达，不另起一轮')
+    const wrapUp = JSON.stringify(model.requests.at(-1)?.messages.at(-1))
+    assert.match(wrapUp, /tool_result/)
+    assert.match(wrapUp, /task-notification/)
+    const after = (await client.request('thread/read', { threadId: child.id, includeTurns: true }))
+      .thread
+    assert.equal(after.turns.length, 2)
+    const answers = after.turns[1].items
+      .filter((item: any) => item.type === 'agentMessage')
+      .map((item: any) => item.text)
+    assert.equal(answers.length, 1, '子线程只显示子代理自己的回答')
+    assert.match(answers[0], /^CHILD_FOLLOWUP_ANSWER 此前共 \d+ 条消息$/)
+    const parent = (
+      await client.request('thread/read', { threadId: thread.id, includeTurns: true })
+    ).thread
+    assert.equal(parent.turns.length, 1, '追问不在父线程里新增回合')
+    assert.ok(!JSON.stringify(parent).includes('CHILD_FOLLOWUP'))
+    // 父线程随后仍能在同一会话上继续，并且知道追问的结果。
+    model.enqueue(() => [{ type: 'text', text: 'MAIN_NEXT_TURN' }])
+    const next = await client.request('turn/start', {
+      threadId: thread.id,
+      input: [{ type: 'text', text: '继续主任务' }],
+    })
+    await assertCompleted(client, model, next.turn.id)
+    assert.ok(
+      JSON.stringify(model.requests.at(-1)?.messages).includes('CHILD_FOLLOWUP_ANSWER'),
+      '父会话应知道子代理追问的结果',
+    )
     model.assertConsumed()
   } finally {
     await client.close()

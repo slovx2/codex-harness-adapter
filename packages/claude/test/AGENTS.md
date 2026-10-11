@@ -38,3 +38,8 @@ node --test packages/claude/dist/claude/test/adapter.test.mjs   # a single suite
   用例超时或在进入 `try` 之前失败时自己的 `finally` 不会执行，留下的进程和端口会让测试文件一直不退出。
   `npm test` 另带 `--test-force-exit`：用例都结束后先执行上面登记的收尾，再退出进程，用例里自己建的
   监听端口不会再把文件挂住。直接用 `node --test` 跑单个文件时建议也带上（`test-harness.test.mts` 固定了这几种情形）。
+- `MockLLM` 的应答按请求到达的顺序出队。同一个 CLI 进程里并发的两路请求（主会话与子代理）谁先到不固定，
+  后台任务的结束通知是并进主会话正在准备的那次请求、还是另起一轮也不固定，慢机器上两种都会出现：
+  应答要按请求内容路由；请求次数随先后变化的场景由用例把先后定下来（`native-subagents.test.mts` 的
+  `enqueueFollowUp`：用模型应答的放行时机或钩子固定先后），不要按固定次数排队赌时序。
+  一个回合用完自己的应答后先 `model.assertConsumed()` 再排下一回合的，剩下的应答不会被后面的请求吃掉。

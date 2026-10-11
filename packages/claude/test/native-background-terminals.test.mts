@@ -46,7 +46,10 @@ test('真实 CLI 的后台 Bash 可在本轮内列出、结束与清理', { time
         nextCursor: string | null
       }
     let listed = await list()
-    for (let attempt = 0; attempt < 100 && !listed.data.length; attempt++) {
+    // 任务先出现在列表里、稍后才关联上工具调用：SDK 的“任务集合变化”与“任务已启动”是两条消息，
+    // 先后不保证。夹在中间的那次列出拿到的是按任务 ID 生成的临时进程号，等关联上再核对。
+    const linked = () => listed.data[0]?.processId === 'claude:toolu_bg_sleep'
+    for (let attempt = 0; attempt < 100 && !linked(); attempt++) {
       await new Promise((resolve) => setTimeout(resolve, 100))
       listed = await list()
     }

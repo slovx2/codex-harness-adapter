@@ -38,12 +38,13 @@ export function summary(item: any): DshThread {
     effort: selection?.reasoningEffort ?? null,
     preset: values.permissions?.currentValue ?? 'workspace-write',
     parentThreadId: item.parentSessionId ?? null,
+    ephemeral: false,
   }
 }
 
 export function envelope(s: DshServer, thread: DshThread, turns: DshTurn[] = []): any {
   const metadata = s.store.getMeta('thread', thread.id) ?? {}
-  const live = s.live.get(thread.id)
+  const live = s.live.get(thread.id) ?? s.ephemeral.get(thread.id)
   return {
     id: thread.id,
     sessionId: thread.id,
@@ -75,7 +76,7 @@ export function envelope(s: DshServer, thread: DshThread, turns: DshTurn[] = [])
       ? { subAgent: { thread_spawn: { parent_thread_id: thread.parentThreadId, depth: 1 } } }
       : 'appServer',
     parentThreadId: thread.parentThreadId,
-    ephemeral: false,
+    ephemeral: thread.ephemeral,
     gitInfo: null,
     agentNickname: null,
     agentRole: null,

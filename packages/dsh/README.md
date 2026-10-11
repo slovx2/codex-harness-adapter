@@ -10,6 +10,10 @@ dsh 本体不随适配器分发：适配器使用用户自己安装的 `dsh`，�
 - 回合、条目标识由 dsh 的回合号、步号、块序号和工具调用号推出，实时增量与落盘消息、重启前后都一致。
 - dsh 只在模型申请沙箱提权时询问，裁决只有"允许这一次"和"拒绝"；对应 Codex 的命令审批与文件改动审批。
 - 权限三档与 Codex 一一对应（`read-only`、`workspace-write`、`danger-full-access`），切换时向会话执行 `/permission`。
+- 临时线程（`thread/start` 带 `ephemeral: true`，桌面端生成标题、摘要时用）只存在于适配器内存里：dsh 没有不落盘的会话，也没有删除会话的接口，所以不为它建 dsh 会话；回包带 `ephemeral: true`，不进线程列表，无人订阅即卸载。
+- dsh 没有结构化输出：临时线程上带 `outputSchema` 的回合不经模型，以空结果正常结束，客户端按"没有结果"走自己的回退；临时线程上的普通回合和普通线程上带 `outputSchema` 的回合如实拒绝。
+- 线程标题用 dsh 自己生成的（`session/title` 转成 `thread/name/updated`）。dsh 把改名视为用户标题并钉住、之后不再自动生成，所以在 dsh 起过标题之前收到的 `thread/name/set`（桌面端会在首条消息发出前把消息原文写回）只当临时名，不转给 dsh；起过标题之后的改名才写进 dsh。
+- dsh 没有对应物的方法（`mcpServerStatus/list`、`app/installed`、`plugin/installed`、`marketplace/add`）答复 -32004"不适用"，与 Claude 入口同一做法；`thread/goal/get` 如实回报没有目标。
 
 ## 版本
 
@@ -49,4 +53,4 @@ node scripts/dsh-poc-serve.mjs --gui     # 同一实例常驻，写入 ~/.ssh/co
 
 ## 尚未覆盖
 
-历史分页（快照之外更早的记录）、计划与提问、用户消息中的图片回显、分叉与回滚、压缩、子代理展示、MCP 管理、技能列表、`thread/timeline/list`。只在 macOS 上验证过；真实桌面界面与真实 DeepSeek 端点尚未经适配器端到端验证。
+历史分页（快照之外更早的记录）、计划与提问、用户消息中的图片回显、分叉与回滚、压缩、子代理展示、MCP 管理、技能列表、`thread/timeline/list`。结构化输出也不支持（见上）。只在 macOS 上验证过；真实桌面界面已在 ChatGPT.app 26.1007 上用回环 mock 模型验证过，真实 DeepSeek 端点尚未经适配器端到端验证。

@@ -12,6 +12,8 @@ export interface DshThread {
   effort: string | null
   preset: Preset
   parentThreadId: string | null
+  // 临时线程只存在于适配器内存里，没有对应的 dsh 会话。
+  ephemeral: boolean
 }
 export interface DshTurn {
   id: string
@@ -113,6 +115,8 @@ export class Projection {
   active: DshTurn | null = null
   turnNumber = 0
   contextWindow: number | null = null
+  // dsh 是否已经给这个会话起过标题（任何来源）；在此之前客户端写来的名字只算临时名。
+  titled = false
   private expected = false
   private attempt: { turn: number; step: number } | null = null
   private readonly open = new Set<string>()
@@ -120,7 +124,7 @@ export class Projection {
   private readonly startedMs = new Map<string, number>()
   private readonly calls = new Map<
     string,
-    { item: any; args: any; done: boolean; declined?: boolean }
+    { item: any; args: any; done: boolean; startedMs: number; declined?: boolean }
   >()
   // 审批编号到工具调用的对应；裁决事件只带审批编号。
   private readonly asked = new Map<string, string>()
@@ -156,14 +160,15 @@ export class Projection {
     } else if (event.type === 'user/message') {
       if (data.source?.kind === 'user') this.userMessage(data, notify)
     } else if (event.type === 'assistant/message') this.assistantMessage(data, notify)
-    else if (event.type === 'tool/call') this.toolCall(data, notify)
-    else if (event.type === 'tool/result') this.toolResult(data, notify)
+    else if (event.type === 'tool/call') this.toolCall(data, event.time, notify)
+    else if (event.type === 'tool/result') this.toolResult(data, event.time, notify)
     else if (event.type === 'approval/asked') this.asked.set(data.id, data.callId)
     else if (event.type === 'approval/decided') {
       const call = this.calls.get(this.asked.get(data.id) ?? '')
       if (call && data.outcome === 'rejected') call.declined = true
     } else if (event.type === 'turn/end') this.end(data.reason ?? {}, event.time, notify)
     else if (event.type === 'session/title') {
+      this.titled = true
       this.thread.name = typeof data.title === 'string' ? data.title : this.thread.name
       notify('thread/name/updated', { threadName: this.thread.name })
     } else if (event.type === 'model/selection') {
@@ -305,22 +310,25 @@ export class Projection {
     })
   }
 
-  private toolCall(data: any, notify: Notify): void {
+  private toolCall(data: any, time: number, notify: Notify): void {
     const turn = this.active
     if (!turn || this.calls.has(data.callId)) return
     const args = parse(data.arguments)
     const item = toolItem(data.callId, String(data.name), args, this.thread.cwd)
-    this.calls.set(data.callId, { item, args, done: false })
+    this.calls.set(data.callId, { item, args, done: false, startedMs: time })
     this.put(turn, item, false, notify)
   }
 
-  private toolResult(data: any, notify: Notify): void {
+  private toolResult(data: any, time: number, notify: Notify): void {
     const call = this.calls.get(data.message?.toolCallId)
     const turn = this.turns.find((entry) => entry.items.includes(call?.item))
     // dsh 裁剪旧结果时会对同一调用追加替换事件，已完成的调用不再改写。
     if (!call || call.done || !turn) return
     call.done = true
     finishTool(call.item, call.args, data.message, data.meta)
+    // 时长取调用与结果两个落盘事件的时间差，实时与回放得到同一个值；文件修改条目没有这个字段。
+    if (call.item.type !== 'fileChange')
+      call.item.durationMs = Math.max(0, Math.round(time - call.startedMs))
     // 用户拒绝提权的调用按协议标成 declined，而不是普通的执行失败；依据是落盘的裁决事件，回放时同样成立。
     if (call.declined && call.item.type !== 'mcpToolCall') call.item.status = 'declined'
     this.put(turn, call.item, true, notify)

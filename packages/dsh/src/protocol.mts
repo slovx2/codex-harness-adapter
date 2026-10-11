@@ -20,6 +20,15 @@ import { runtimeInfo, versions } from './versions.mjs'
 const unsupported = (method: string) =>
   new ProtocolError(-32601, `dsh 入口（打样阶段）不支持 ${method}`)
 
+// dsh 没有对应物的能力：与 Claude 入口同一做法，明确答复"不适用"（-32004），不报"方法不存在"，也不伪造成功。
+const NOT_APPLICABLE: Record<string, string> = {
+  // dsh 的 MCP 服务由 dsh 自己配置和管理，远程接口没有公开状态；这里无法如实列出，不能回一个空列表充数。
+  'mcpServerStatus/list': 'dsh 的 MCP 服务由 dsh 自己管理，远程接口没有公开其状态',
+  'app/installed': 'OpenAI 应用连接器是 Codex 专属能力',
+  'plugin/installed': 'Codex 插件是 Codex 专属能力',
+  'marketplace/add': 'Codex 插件市场是 Codex 专属能力',
+}
+
 async function models(s: DshServer): Promise<any[]> {
   const catalog = await (await s.remote()).rpc('session/modelCatalog', {}, (value) =>
     Array.isArray(value?.groups),
@@ -72,6 +81,11 @@ export async function dispatch(s: DshServer, peer: RpcPeer, method: string, p: a
       (projectId, changeType) => s.notify(null, 'project/changed', { projectId, changeType }),
       (threadId, projectId) => s.notify(threadId, 'thread/project/updated', { projectId }),
     )
+  if (NOT_APPLICABLE[method])
+    throw new ProtocolError(
+      -32004,
+      `dsh 运行时不适用此能力: ${method}（${NOT_APPLICABLE[method]}）`,
+    )
   switch (method) {
     case 'initialize':
       return {
@@ -105,6 +119,20 @@ export async function dispatch(s: DshServer, peer: RpcPeer, method: string, p: a
     case 'hooks/list':
     case 'experimentalFeature/list':
       return { data: [], nextCursor: null }
+    case 'experimentalFeature/enablement/set': {
+      const { enablement } = p
+      if (
+        !enablement ||
+        typeof enablement !== 'object' ||
+        Array.isArray(enablement) ||
+        Object.values(enablement).some((value) => typeof value !== 'boolean')
+      )
+        throw new ProtocolError(-32602, 'enablement 必须是布尔值映射')
+      // 没有已实现的实验开关：空映射是无操作，其余完整校验后拒绝，不能回显成已应用。
+      if (Object.keys(enablement).length)
+        throw new ProtocolError(-32004, 'dsh 运行时尚未实现所请求的实验功能开关；未修改任何设置')
+      return { enablement: {} }
+    }
     case 'plugin/list':
       return { marketplaces: [], marketplaceLoadErrors: [], featuredPluginIds: [] }
     case 'plugin/share/list':
@@ -170,6 +198,26 @@ export async function dispatch(s: DshServer, peer: RpcPeer, method: string, p: a
       const cwd = p.cwd ?? process.cwd()
       if (typeof cwd !== 'string' || !isAbsolute(cwd))
         throw new ProtocolError(-32602, 'cwd 必须是绝对路径')
+      if (p.ephemeral === true) {
+        // 临时线程不建 dsh 会话；模型只用于回报，按目录核对，允许回退时改用默认模型。
+        const catalog = await models(s)
+        const defaults = s.store.getMeta('config', 'defaults') ?? {}
+        const requested = p.model ?? p.config?.model ?? defaults.model ?? null
+        const known = catalog.find((model) => model.id === requested)
+        if (requested && !known && !p.allowProviderModelFallback)
+          throw new ProtocolError(-32602, `dsh 没有模型 ${requested}`)
+        const chosen = known ?? catalog.find((model) => model.isDefault) ?? null
+        const live = s.openEphemeral(peer, {
+          cwd,
+          model: chosen?.id ?? null,
+          effort:
+            p.effort ?? p.config?.model_reasoning_effort ?? chosen?.defaultReasoningEffort ?? null,
+          preset: presetFromParams(p),
+        })
+        const started = envelope(s, live.projection.thread)
+        setImmediate(() => s.notify(started.id, 'thread/started', { thread: started }))
+        return settings(s, live)
+      }
       const remote = await s.remote()
       const created = await remote.rpc(
         'session/create',
@@ -228,22 +276,26 @@ export async function dispatch(s: DshServer, peer: RpcPeer, method: string, p: a
       )
     }
     case 'thread/loaded/list':
-      return { data: [...s.live.keys()], nextCursor: null }
+      return { data: [...s.live.keys(), ...s.ephemeral.keys()], nextCursor: null }
     case 'thread/resume':
     case 'thread/read': {
       const live = await s.load(requiredString(p.threadId, 'threadId'))
       const { thread, turns } = live.projection
       s.subscribe(peer, thread.id)
-      return method === 'thread/resume'
-        ? { ...settings(s, live), ...historyHeadCursors(thread.id, turns) }
-        : { thread: envelope(s, thread, p.includeTurns === false ? [] : turns) }
+      if (method === 'thread/read')
+        return { thread: envelope(s, thread, p.includeTurns === false ? [] : turns) }
+      const resumed = settings(s, live)
+      // excludeTurns 时不带回合，历史由客户端按游标另取。
+      if (p.excludeTurns === true) resumed.thread.turns = []
+      return { ...resumed, ...historyHeadCursors(thread.id, turns) }
     }
     case 'thread/unsubscribe': {
       const subscribed = s.subscriptions.get(p.threadId)?.delete(peer.id)
+      const ephemeral = s.releaseEphemeral(p.threadId)
       return {
         status: subscribed
           ? 'unsubscribed'
-          : s.live.has(p.threadId)
+          : s.live.has(p.threadId) || ephemeral
             ? 'notSubscribed'
             : 'notLoaded',
       }
@@ -269,11 +321,27 @@ export async function dispatch(s: DshServer, peer: RpcPeer, method: string, p: a
       })
       return { turnId: active.id }
     }
-    case 'thread/name/set':
+    case 'thread/name/set': {
+      const { projection } = await s.load(requiredString(p.threadId, 'threadId'))
+      const name = requiredString(p.name, 'name')
+      // 与当前标题相同：无事可做，也不把它钉成用户标题。
+      if (projection.thread.name === name) return {}
+      // dsh 还没给这个会话起过标题时，客户端写来的名字只当临时名（桌面端在首条消息发出前会把消息原文
+      // 写回）：不调用 dsh 的改名。dsh 把改名视为用户标题并钉住，之后不再自动生成，模型起的标题就出不来了。
+      if (projection.thread.ephemeral || !projection.titled) {
+        projection.thread.name = name
+        s.notify(p.threadId, 'thread/name/updated', { threadName: name })
+        return {}
+      }
       await (await s.remote()).rpc('session/rename', {
-        request: { sessionId: p.threadId, title: requiredString(p.name, 'name') },
+        request: { sessionId: p.threadId, title: name },
       })
       return {}
+    }
+    case 'thread/goal/get':
+      // dsh 没有目标功能：线程存在时如实回报"没有目标"。
+      await s.load(requiredString(p.threadId, 'threadId'))
+      return { goal: null }
     case 'thread/settings/update':
     case 'turn/settings/update': {
       const live = await s.load(requiredString(p.threadId, 'threadId'))

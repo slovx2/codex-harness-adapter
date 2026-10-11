@@ -8,7 +8,7 @@ import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { once } from 'node:events'
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { Duplex } from 'node:stream'
@@ -272,6 +272,35 @@ async function verify(instance) {
     [],
     '空白会话不进列表',
   )
+  // 桌面端新建线程时的顺序：另开一条临时线程跑标题回合 → 没有结果时把首条消息原文写回 → 首个回合。
+  // 临时线程不进线程列表、不在 dsh 里建会话；写回的名字不钉住，标题最终来自 dsh 自己的生成。
+  const helper = await desktop.rpc('thread/start', {
+    cwd: project,
+    ephemeral: true,
+    model: 'gpt-6-luna',
+    allowProviderModelFallback: true,
+    approvalPolicy: 'never',
+    permissions: ':read-only',
+  })
+  assert.equal(helper.thread.ephemeral, true, '临时线程的回包要带 ephemeral')
+  await desktop.rpc('turn/start', {
+    threadId: helper.thread.id,
+    turnTrigger: 'thread_title',
+    input: [{ type: 'text', text: '起一个标题。\n\nUser prompt:\n请开始 DSH_POC_CHAT' }],
+    outputSchema: {
+      type: 'object',
+      properties: { title: { type: 'string' }, description: { type: 'string' } },
+      required: ['title', 'description'],
+    },
+  })
+  const titleTurn = await desktop.until(
+    'turn/completed',
+    (params) => params.threadId === helper.thread.id,
+  )
+  assert.equal(titleTurn.turn.status, 'completed', '标题回合不应报错')
+  assert.ok(!titleTurn.turn.items.some((item) => item.type === 'agentMessage'))
+  await desktop.rpc('thread/unsubscribe', { threadId: helper.thread.id })
+  await desktop.rpc('thread/name/set', { threadId: first, name: '请开始 DSH_POC_CHAT' })
   const chat = await turn(first, '请开始 DSH_POC_CHAT')
   const message = chat.items.find((item) => item.type === 'agentMessage')
   const deltas = desktop.notifications.filter(
@@ -314,6 +343,16 @@ async function verify(instance) {
   const chatThread = listed.data.find((thread) => thread.id === first)
   assert.match(chatThread.preview, /DSH_POC_CHAT/)
   assert.equal(chatThread.name, 'dsh打样-CHAT', '线程标题来自 dsh 的标题生成')
+  const stored = await readdir(join(instance.root, 'state', 'dsh', 'dsh-home', 'sessions'), {
+    recursive: true,
+  })
+  assert.equal(
+    stored.filter((entry) => /(^|\/)session-[0-9a-f-]{36}$/.test(entry)).length,
+    2,
+    'dsh 的会话存储里只有两条真实线程，没有标题线程留下的空会话',
+  )
+  const lean = await other.rpc('thread/resume', { threadId: first, excludeTurns: true })
+  assert.deepEqual(lean.thread.turns, [], 'excludeTurns 时不带回合')
   const resumed = await other.rpc('thread/resume', { threadId: first })
   assert.deepEqual(
     resumed.thread.turns.flatMap((entry) => entry.items.map((item) => item.id)),

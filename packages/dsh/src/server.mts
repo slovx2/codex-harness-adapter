@@ -23,6 +23,8 @@ const trace = (direction: 'in' | 'out', message: unknown) => {
   if (tracePath) appendFileSync(tracePath, `${JSON.stringify({ direction, message })}\n`)
 }
 
+const EPHEMERAL_PREFIX = 'ephemeral-'
+
 export interface LiveThread {
   projection: Projection
   cancel: () => void
@@ -43,6 +45,8 @@ export class DshServer {
   readonly peers = new Map<string, RpcPeer>()
   readonly subscriptions = new Map<string, Set<string>>()
   readonly live = new Map<string, LiveThread>()
+  // 临时线程（客户端生成标题、摘要时用）：只在内存里，没有 dsh 会话，无人订阅即卸载。
+  readonly ephemeral = new Map<string, LiveThread>()
   readonly runtime: DshRuntime
   private readonly loading = new Map<string, Promise<LiveThread>>()
   private readonly locks = new Map<string, Promise<unknown>>()
@@ -175,8 +179,11 @@ export class DshServer {
 
   // 打开会话的跟随流：先用快照回放历史，之后的落盘事件与实时增量转成协议通知。
   load(id: string): Promise<LiveThread> {
-    const loaded = this.live.get(id)
+    const loaded = this.live.get(id) ?? this.ephemeral.get(id)
     if (loaded) return Promise.resolve(loaded)
+    // 临时线程卸载后不复存在，不必去问 dsh。
+    if (id.startsWith(EPHEMERAL_PREFIX))
+      return Promise.reject(new ProtocolError(-32602, '临时线程已卸载'))
     const loading =
       this.loading.get(id) ??
       this.open(id).finally(() => {
@@ -226,6 +233,46 @@ export class DshServer {
     })
   }
 
+  // dsh 没有不落盘的会话，这里只建内存里的线程：不调用 dsh，线程列表和 dsh 的会话存储里都不会出现。
+  openEphemeral(
+    peer: RpcPeer,
+    values: { cwd: string; model: string | null; effort: string | null; preset: Preset | null },
+  ): LiveThread {
+    const now = Math.floor(Date.now() / 1000)
+    const thread: DshThread = {
+      id: `${EPHEMERAL_PREFIX}${randomUUID()}`,
+      cwd: values.cwd,
+      name: null,
+      preview: '',
+      createdAt: now,
+      updatedAt: now,
+      model: values.model,
+      effort: values.effort,
+      preset: values.preset ?? 'read-only',
+      parentThreadId: null,
+      ephemeral: true,
+    }
+    const live: LiveThread = {
+      projection: new Projection(thread),
+      cancel: () => {},
+      preset: values.preset,
+      submitted: new Map(),
+    }
+    this.ephemeral.set(thread.id, live)
+    this.subscribe(peer, thread.id)
+    return live
+  }
+
+  // 无人订阅的临时线程立即卸载；返回卸载前它是否存在。
+  releaseEphemeral(id: string): boolean {
+    if (!this.ephemeral.has(id)) return false
+    if (!this.subscriptions.get(id)?.size) {
+      this.ephemeral.delete(id)
+      this.subscriptions.delete(id)
+    }
+    return true
+  }
+
   start(peer: RpcPeer, live: LiveThread, params: any): DshTurn {
     const { projection } = live
     const clientId = params.clientUserMessageId ?? params.clientMessageId ?? null
@@ -236,6 +283,7 @@ export class DshServer {
         ))
       : undefined
     if (submitted) return submitted
+    if (projection.thread.ephemeral) return this.helperTurn(peer, live, params, clientId)
     if (params.outputSchema != null)
       throw new ProtocolError(-32602, 'dsh 入口暂不支持严格结构化输出')
     if (projection.active) throw new ProtocolError(-32009, '会话已有活动回合')
@@ -266,10 +314,59 @@ export class DshServer {
     return turn
   }
 
+  // 临时线程上的回合：没有 dsh 会话也就没有模型可用。带输出结构的回合（标题、摘要等）以空结果
+  // 正常结束，客户端按"没有结果"走自己的回退；普通回合如实拒绝。标题改由 dsh 自己生成后推送。
+  private helperTurn(
+    peer: RpcPeer,
+    live: LiveThread,
+    params: any,
+    clientId: string | null,
+  ): DshTurn {
+    const { projection } = live
+    if (params.outputSchema == null)
+      throw new ProtocolError(-32602, 'dsh 没有不落盘的会话，临时线程不能运行普通回合')
+    if (projection.active) throw new ProtocolError(-32009, '会话已有活动回合')
+    const threadId = projection.thread.id
+    const notify = (method: string, value: any) => this.notify(threadId, method, value)
+    this.subscribe(peer, threadId)
+    const turn = projection.expect(notify)
+    if (clientId) live.submitted.set(clientId, turn)
+    setImmediate(() => {
+      const content = (Array.isArray(params.input) ? params.input : []).filter(
+        (part: any) => part?.type === 'text',
+      )
+      projection.apply(
+        {
+          type: 'user/message',
+          seq: -1,
+          time: Date.now(),
+          data: {
+            id: clientId ?? randomUUID(),
+            source: { kind: 'user', rpcId: clientId },
+            content,
+          },
+        },
+        notify,
+      )
+      projection.apply(
+        { type: 'turn/end', seq: -1, time: Date.now(), data: { reason: { kind: 'completed' } } },
+        notify,
+      )
+    })
+    return turn
+  }
+
   async applySettings(remote: WebRemote, live: LiveThread, params: any): Promise<void> {
     const { thread } = live.projection
     const preset = presetFromParams(params) ?? live.preset
     if (preset) live.preset = preset
+    if (thread.ephemeral) {
+      // 没有 dsh 会话可设置，只记下客户端选的值用于回报。
+      if (preset) thread.preset = preset
+      if (typeof params.model === 'string' && params.model) thread.model = params.model
+      if (typeof params.effort === 'string' && params.effort) thread.effort = params.effort
+      return
+    }
     if (preset && preset !== thread.preset)
       await remote.rpc('commands/execute', {
         agentId: thread.id,
@@ -345,6 +442,7 @@ export class DshServer {
     this.files.closePeer(peer.id)
     this.processes.closePeer(peer.id)
     for (const ids of this.subscriptions.values()) ids.delete(peer.id)
+    for (const id of [...this.ephemeral.keys()]) this.releaseEphemeral(id)
     this.rejectPending((entry) => entry.peer === peer.id, '客户端已断开')
   }
 
@@ -394,6 +492,7 @@ function replay(id: string, snapshot: any): Projection {
     effort: selection?.reasoningEffort ?? null,
     preset: values.permissions?.currentValue ?? 'workspace-write',
     parentThreadId: snapshot.header?.parentSession ?? null,
+    ephemeral: false,
   }
   const projection = new Projection(thread)
   projection.contextWindow = values.contextPressure?.contextWindow ?? null

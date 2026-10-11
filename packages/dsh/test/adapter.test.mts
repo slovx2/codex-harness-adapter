@@ -4,68 +4,9 @@ import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promi
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import type { RpcPeer, WireMessage } from '../../shared/src/types.mjs'
 import { DshServer } from '../src/server.mjs'
+import { client, violations } from './client.mjs'
 import { startMockModel } from './mock-model.mjs'
-import { assertNotification, assertResponse, assertServerRequest } from './schema.mjs'
-
-// 假客户端：记录通知，按 handler 应答服务端发起的反向请求；往来消息一律按协议 schema 校验。
-// schema 违例先收集、最后统一断言：在发送路径上直接抛错会被服务端当成回合失败吞掉。
-const violations = new Set<string>()
-const checked = (check: () => void) => {
-  try {
-    check()
-  } catch (error) {
-    violations.add(String((error as Error).message).slice(0, 600))
-  }
-}
-
-function client(server: DshServer) {
-  const notifications: any[] = []
-  const requests: any[] = []
-  const waiting = new Map<string, (message: any) => void>()
-  let answer: (request: any) => unknown = () => ({})
-  const peer: RpcPeer = {
-    id: randomUUID(),
-    close() {},
-    send(message: WireMessage) {
-      const wire = message as any
-      if (wire.method && wire.id !== undefined) {
-        checked(() => assertServerRequest(wire.method, wire.params))
-        requests.push(wire)
-        void server.handle(peer, { jsonrpc: '2.0', id: wire.id, result: answer(wire) })
-      } else if (wire.method) {
-        checked(() => assertNotification(wire.method, wire.params))
-        notifications.push(wire)
-      } else waiting.get(String(wire.id))?.(wire)
-    },
-  }
-  return {
-    peer,
-    notifications,
-    requests,
-    onRequest(handler: (request: any) => unknown) {
-      answer = handler
-    },
-    async call(method: string, params: unknown = {}): Promise<any> {
-      const id = randomUUID()
-      const reply = new Promise<any>((resolve) => waiting.set(id, resolve))
-      await server.handle(peer, { jsonrpc: '2.0', id, method, params })
-      const message = await reply
-      if (message.error) throw new Error(`${method}: ${message.error.message}`)
-      checked(() => assertResponse(method, message.result))
-      return message.result
-    },
-    async until(method: string, match: (params: any) => boolean = () => true): Promise<any> {
-      for (let waited = 0; waited < 20000; waited += 20) {
-        const found = notifications.find((entry) => entry.method === method && match(entry.params))
-        if (found) return found.params
-        await new Promise((resolve) => setTimeout(resolve, 20))
-      }
-      throw new Error(`等待通知超时: ${method}`)
-    },
-  }
-}
 
 test('dsh：线程列表、发消息、逐字流、提权审批、历史回放与中断', { timeout: 120000 }, async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'codex-harness-adapter-dsh-')))
@@ -207,6 +148,10 @@ test('dsh：线程列表、发消息、逐字流、提权审批、历史回放�
     assert.equal(items[5].status, 'completed')
     assert.equal(items[5].exitCode, 0)
     assert.match(items[5].aggregatedOutput, /approved/)
+    assert.ok(
+      Number.isInteger(items[5].durationMs) && items[5].durationMs >= 0,
+      '命令条目带执行时长（毫秒）',
+    )
     assert.equal(desktop.requests.length, 1, '只在提权时询问一次')
     assert.ok(desktop.notifications.some((entry) => entry.method === 'thread/tokenUsage/updated'))
     assert.ok(
@@ -270,10 +215,12 @@ test('dsh：线程列表、发消息、逐字流、提权审批、历史回放�
       (params) => params.threadId === refused.id,
     )
     assert.equal(declined.turn.status, 'completed')
-    assert.equal(
-      declined.turn.items.find((item: any) => item.type === 'commandExecution').status,
-      'declined',
-    )
+    const rejected = declined.turn.items.find((item: any) => item.type === 'commandExecution')
+    assert.equal(rejected.status, 'declined')
+    // 与 Claude 入口对照：除状态用协议的 declined 外，退出码、输出、时长三项都如实给出。
+    assert.equal(rejected.exitCode, 1)
+    assert.match(rejected.aggregatedOutput, /rejected/)
+    assert.ok(Number.isInteger(rejected.durationMs) && rejected.durationMs >= 0)
     assert.equal(declined.turn.items.at(-1).text, '已停止提权。')
     await assert.rejects(readFile(join(cwd, 'denied.txt')), '被拒绝的命令不应执行')
 
@@ -308,6 +255,14 @@ test('dsh：线程列表、发消息、逐字流、提权审批、历史回放�
     )
     assert.equal(resumed.thread.turns[0].status, 'completed')
     assert.ok(resumed.turnsBackwardsCursor)
+    assert.equal(
+      resumed.thread.turns[0].items[5].durationMs,
+      items[5].durationMs,
+      '回放时命令时长与实时一致',
+    )
+    const lean = await desktop.call('thread/resume', { threadId, excludeTurns: true })
+    assert.deepEqual(lean.thread.turns, [], 'excludeTurns 时不带回合')
+    assert.ok(lean.turnsBackwardsCursor, 'excludeTurns 时仍给出历史游标')
     const replayed = await desktop.call('thread/read', { threadId: refused.id, includeTurns: true })
     assert.equal(
       replayed.thread.turns[0].items.find((item: any) => item.type === 'commandExecution').status,

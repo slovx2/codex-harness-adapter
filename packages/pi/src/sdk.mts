@@ -50,4 +50,5 @@ const missing = Object.entries({
   .map(([name]) => name)
 if (missing.length) throw incompatible(`缺少 ${missing.join('、')}`)
 export type DefaultResourceLoader = PiSdk.DefaultResourceLoader
+export type SessionManager = PiSdk.SessionManager
 export type SettingsManager = PiSdk.SettingsManager

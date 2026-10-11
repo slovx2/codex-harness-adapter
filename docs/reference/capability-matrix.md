@@ -173,7 +173,8 @@ codex.
   "not a git repository" from real errors) rather than swallowed.
 - Per-thread in-memory state (command approvals, elicitation counts)
   is released when a thread is archived.
-- 用量快照持久化在 SQLite。恢复会话推送已保存的累计用量，归档不清零，fork 复制后独立累计。
+- 用量快照持久化在 SQLite。恢复会话推送已保存的累计用量，归档不清零，fork 复制后独立累计；
+  按位置分叉时，记在被切掉的回合上的用量不带过去，分叉自己跑完一轮后才有用量。
   EVENTS-002 通过真实 SDK 验证多块文本、事件顺序、历史与用量在重启后的一致性。
 - 目标记录保存在 SQLite，归档和重启后仍保留；fork 复制独立快照，删除会话同时删除目标。
   部分更新保留未提供字段，显式 null 清除 tokenBudget。GOAL-001/003 验证这些存储语义。

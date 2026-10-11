@@ -5,6 +5,12 @@ The project is still private in `package.json`; this file tracks release notes
 for maintainers preparing the next public release and does not change package
 versioning or publishing metadata.
 
+## 未发布
+
+- 修复 Claude 与 Pi 入口“从旧位置分叉”得到的对话与原对话完全相同的问题：`thread/fork` 现在按 `lastTurnId` / `beforeTurnId`
+  截断，分叉里只保留该位置之前的回合，之后发给模型的历史也只含这些回合，源会话不变。此前这两个参数被忽略，总是整份复制，
+  而桌面端在这种情况下不会再补发回退。分叉到第一条消息之前得到空会话；两个参数同时给、或所指回合不在会话当前历史里时拒绝。
+
 ## 0.5.0
 
 - Claude 的后台命令（`run_in_background` 的 Bash）跨回合存活：回合结束时还有后台命令在跑，Claude 进程就留下，

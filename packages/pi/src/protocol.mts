@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { unlink } from 'node:fs/promises'
 import { isAbsolute, join } from 'node:path'
 import { gitDiffToRemote } from '../../shared/src/git-diff-remote.mjs'
@@ -28,7 +29,7 @@ import {
 } from './sdk.mjs'
 import type { PiServer } from './server.mjs'
 import { skillsAt, writeSkill } from './skills.mjs'
-import type { PiThread } from './store.mjs'
+import type { PiThread, PiTurn } from './store.mjs'
 import { promptInput } from './turn.mjs'
 import { runtimeInfo, versions } from './versions.mjs'
 
@@ -514,8 +515,58 @@ function restoreUsage(s: PiServer, peer: RpcPeer, threadId: string): void {
   )
 }
 
+// 回合在原生分支上的起始条目：适配器回合是自己写入的标记条目，原生回合以首个条目的 ID 命名。
+function turnStartEntry(branch: any[], turnId: string): any {
+  const entry =
+    branch.find(
+      (e) =>
+        e.type === 'custom' &&
+        e.customType === 'codex-harness-adapter-turn' &&
+        (e.data as any)?.id === turnId,
+    ) ?? branch.find((e) => `native:${e.id}` === turnId)
+  if (!entry) throw new ProtocolError(-32602, '无法定位原生会话边界')
+  return entry
+}
+
+// 按分叉位置建出新的原生会话；turns 与 branch 是源会话当前的回合和原生分支，源文件 path 不动。
+function forkSession(
+  path: string,
+  cwd: string,
+  turns: PiTurn[],
+  branch: any[],
+  p: any,
+): SessionManager {
+  const directory = sessionDirectory(cwd)
+  // lastTurnId 保留到该回合为止（含），beforeTurnId 从该回合起都不要；两者都归结为“第一个不要的回合”。
+  const anchor = p.lastTurnId ?? p.beforeTurnId
+  let firstRemoved: PiTurn | undefined
+  if (anchor != null) {
+    const index = turns.findIndex((t) => t.id === anchor)
+    if (index < 0) throw new ProtocolError(-32602, '分叉位置的回合不在该会话当前的历史里')
+    firstRemoved = turns[p.lastTurnId != null ? index + 1 : index]
+  }
+  // 没有要切掉的回合（不带位置，或保留到最后一轮）时整份复制。
+  if (!firstRemoved) return SessionManager.forkFrom(path, cwd, directory)
+  const leafId = turnStartEntry(branch, firstRemoved.id).parentId
+  // 与 Pi 自己的 /fork 相同：新会话只含根到该条目的路径，被切掉的回合不写进新文件。
+  if (!leafId) return SessionManager.create(cwd, directory, { parentSession: path })
+  if (!existsSync(path)) throw new ProtocolError(-32602, '尚无原生会话文件')
+  const manager = SessionManager.open(path, directory, cwd)
+  manager.createBranchedSession(leafId)
+  return manager
+}
+
 async function nativeMutation(s: PiServer, peer: RpcPeer, method: string, p: any): Promise<any> {
+  if (method === 'thread/fork' && p.lastTurnId != null && p.beforeTurnId != null)
+    throw new ProtocolError(-32602, 'beforeTurnId 不能与 lastTurnId 同时使用')
   const thread = s.store.thread(p.threadId)
+  // 协议规定 lastTurnId 所指回合不能在进行中；其余情况沿用活动会话不可变更的限制。
+  if (
+    method === 'thread/fork' &&
+    p.lastTurnId != null &&
+    p.lastTurnId === s.active.get(thread.id)?.turn.id
+  )
+    throw new ProtocolError(-32602, 'lastTurnId 所指回合仍在进行中')
   if (s.active.has(thread.id)) throw new ProtocolError(-32009, '活动会话不能执行此操作')
   const live = await s.load(thread, peer, true),
     session = live.session
@@ -535,17 +586,31 @@ async function nativeMutation(s: PiServer, peer: RpcPeer, method: string, p: any
   }
   if (method === 'thread/fork') {
     if (!thread.path) throw new ProtocolError(-32602, '尚无原生会话文件')
-    const manager = SessionManager.forkFrom(thread.path, thread.cwd, sessionDirectory(thread.cwd))
+    const manager = forkSession(
+      thread.path,
+      thread.cwd,
+      s.store.turns(thread.id),
+      session.sessionManager.getBranch(),
+      p,
+    )
+    // 线程名属于线程而不是某个回合：改名记录落在被切掉的回合里时，在分叉里补回。
+    if ((manager.getSessionName() ?? null) !== thread.name)
+      manager.appendSessionInfo(thread.name ?? '')
+    // 预览是第一条用户消息；它也被切掉时（分叉到第一轮之前）不能沿用。
+    const keepsPreview = manager
+      .getEntries()
+      .some((e) => e.type === 'message' && e.message.role === 'user')
     const fork = {
       ...thread,
       id: manager.getSessionId(),
       path: manager.getSessionFile() ?? null,
+      preview: keepsPreview ? thread.preview : '',
       forkedFromId: thread.id,
       createdAt: Math.floor(Date.now() / 1000),
     }
     s.store.saveThread(fork)
     s.subscribe(peer, fork.id)
-    await s.load(fork, peer)
+    await s.load(fork, peer, false, manager)
     return s.settings(fork)
   }
   const turns = s.store.turns(thread.id)
@@ -556,15 +621,7 @@ async function nativeMutation(s: PiServer, peer: RpcPeer, method: string, p: any
   if (!Number.isInteger(count) || count < 1 || count > turns.length)
     throw new ProtocolError(-32602, '无效回退边界')
   const firstRemoved = turns[turns.length - count]!
-  const branch = session.sessionManager.getBranch()
-  const entry =
-    branch.find(
-      (e) =>
-        e.type === 'custom' &&
-        e.customType === 'codex-harness-adapter-turn' &&
-        (e.data as any)?.id === firstRemoved.id,
-    ) ?? branch.find((e) => `native:${e.id}` === firstRemoved.id)
-  if (!entry) throw new ProtocolError(-32602, '无法定位原生会话边界')
+  const entry = turnStartEntry(session.sessionManager.getBranch(), firstRemoved.id)
   if (entry.parentId) await session.navigateTree(entry.parentId, { summarize: false })
   else {
     session.sessionManager.resetLeaf()

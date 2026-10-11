@@ -29,7 +29,12 @@ export interface LiveSession {
   dispose(): Promise<void>
 }
 
-export async function openSession(thread: PiThread, host: SessionHost): Promise<LiveSession> {
+// prepared 是调用方已经建好的会话（分叉）；省略时按线程记录打开或新建。
+export async function openSession(
+  thread: PiThread,
+  host: SessionHost,
+  prepared?: SessionManager,
+): Promise<LiveSession> {
   const agentDir = getAgentDir()
   const settingsManager = SettingsManager.create(thread.cwd, agentDir)
   const eventBus = createEventBus()
@@ -90,11 +95,13 @@ export async function openSession(thread: PiThread, host: SessionHost): Promise<
   const errors = loader.getExtensions().errors
   if (errors.length) throw new Error(`Pi 扩展加载失败: ${errors.map((e) => e.error).join('; ')}`)
   const restoring = Boolean(thread.path && existsSync(thread.path))
-  const manager = thread.ephemeral
-    ? SessionManager.inMemory(thread.cwd)
-    : restoring
-      ? SessionManager.open(thread.path!, sessionDirectory(thread.cwd), thread.cwd)
-      : SessionManager.create(thread.cwd, sessionDirectory(thread.cwd))
+  const manager =
+    prepared ??
+    (thread.ephemeral
+      ? SessionManager.inMemory(thread.cwd)
+      : restoring
+        ? SessionManager.open(thread.path!, sessionDirectory(thread.cwd), thread.cwd)
+        : SessionManager.create(thread.cwd, sessionDirectory(thread.cwd)))
   const { session } = await createAgentSession({
     cwd: thread.cwd,
     agentDir,

@@ -12,6 +12,7 @@ import { NativeFiles, nativeBranch, sessionIndexDirectories } from './native-fil
 import { discoverSessions, projectHistory } from './projection.mjs'
 import { dispatch } from './protocol.mjs'
 import { type LiveSession, openSession, planState } from './runtime.mjs'
+import type { SessionManager } from './sdk.mjs'
 import { PiStore, type PiThread, type PiTurn } from './store.mjs'
 import { onEvent, runTurn } from './turn.mjs'
 import { createUi } from './ui.mjs'
@@ -194,12 +195,18 @@ export class PiServer {
       this.indexing = null
     }
   }
-  async load(thread: PiThread, peer: RpcPeer, refresh = false): Promise<LiveSession> {
+  // prepared 只在线程还没有执行会话时使用：分叉把刚建好的原生会话直接交给执行会话。
+  async load(
+    thread: PiThread,
+    peer: RpcPeer,
+    refresh = false,
+    prepared?: SessionManager,
+  ): Promise<LiveSession> {
     const pending = this.loading.get(thread.id)
     if (pending) return this.synchronize(thread, await pending)
     const loading = (async () => {
       await this.releasing.get(thread.id)
-      return this.open(thread, peer, refresh)
+      return this.open(thread, peer, refresh, prepared)
     })()
     this.loading.set(thread.id, loading)
     try {
@@ -208,7 +215,12 @@ export class PiServer {
       this.loading.delete(thread.id)
     }
   }
-  private async open(thread: PiThread, peer: RpcPeer, refresh: boolean): Promise<LiveSession> {
+  private async open(
+    thread: PiThread,
+    peer: RpcPeer,
+    refresh: boolean,
+    prepared?: SessionManager,
+  ): Promise<LiveSession> {
     const cached = this.sessions.get(thread.id)
     if (
       !thread.ephemeral &&
@@ -230,19 +242,23 @@ export class PiServer {
     }
     const reverse = (method: string, params: any, signal?: AbortSignal) =>
       this.call(this.active.get(thread.id)?.peer ?? peer, thread.id, method, params, signal)
-    const live = await openSession(thread, {
-      ui: createUi(reverse, (method, params) => {
-        if (method === 'warning') this.active.get(thread.id)?.notices?.push(params.message)
-        this.notify(thread.id, method, params)
-      }),
-      emit: (event) => onEvent(this, thread, event),
-      tool: (tool, args, id, signal) =>
-        reverse(
-          'item/tool/call',
-          { tool: tool.name, namespace: tool.namespace, arguments: args, callId: id, itemId: id },
-          signal,
-        ),
-    })
+    const live = await openSession(
+      thread,
+      {
+        ui: createUi(reverse, (method, params) => {
+          if (method === 'warning') this.active.get(thread.id)?.notices?.push(params.message)
+          this.notify(thread.id, method, params)
+        }),
+        emit: (event) => onEvent(this, thread, event),
+        tool: (tool, args, id, signal) =>
+          reverse(
+            'item/tool/call',
+            { tool: tool.name, namespace: tool.namespace, arguments: args, callId: id, itemId: id },
+            signal,
+          ),
+      },
+      prepared,
+    )
     this.sessions.set(thread.id, live)
     return this.synchronize(thread, live)
   }

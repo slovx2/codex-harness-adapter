@@ -132,6 +132,7 @@ import {
   subagentRelayPrompt,
 } from './subagent-projection.mjs'
 import { threadAttachmentRequest } from './thread-attachments.mjs'
+import { forkPositionFromParams, forkRetainedTurns } from './thread-fork.mjs'
 import type { ThreadGoal } from './thread-goals.mjs'
 import { patchGitInfo } from './thread-metadata.mjs'
 import { threadQueueRequest } from './thread-queue.mjs'
@@ -1178,10 +1179,13 @@ export class CodexClaudeAppServer {
     const parentId = stringOr(params.threadId, '')
     const parent = this.store.getThread(parentId)
     if (!parent) throw new Error(`unknown thread: ${parentId}`)
+    const position = forkPositionFromParams(params)
     if (this.activeTurnByThread.has(parentId)) throw new ProtocolError(-32009, '活动会话不能分叉')
-    const nativeFork = parent.claudeSessionId ? await this.forkNativeSession(parent) : null
+    // 位置参数（lastTurnId / beforeTurnId）决定带走哪些回合；源线程的回合、原生会话和进程都不动。
     const parentTurns = this.store.listTurns(parentId)
-    const boundaries = this.remapNativeBoundaries(parentTurns, nativeFork)
+    const retained = forkRetainedTurns(parentTurns, position)
+    const nativeFork = await this.forkNativeHistory(parent, parentTurns, retained)
+    const boundaries = this.remapNativeBoundaries(retained, nativeFork)
     const now = nowSeconds()
     const id = newId()
     const requestedCwd = stringOr(params.cwd, parent.cwd)
@@ -1191,6 +1195,8 @@ export class CodexClaudeAppServer {
       id,
       sessionId: id,
       forkedFromId: parent.id,
+      // 预览取自第一条用户消息；一个回合都没带过来时留空，由分叉里的第一条消息填。
+      preview: position && !retained.length ? '' : parent.preview,
       isPinned: false,
       sectionId: null,
       sectionEnteredAt: null,
@@ -1254,7 +1260,8 @@ export class CodexClaudeAppServer {
       this.store.saveThreadGoal({ ...parentGoal, threadId: id })
     const parentUsage = this.store.threadUsage(parentId)
     this.saveRuntimeSettings(id, params)
-    for (const turn of parentTurns) {
+    // 按回合存放的数据只跟着带走的回合走：用量记在被切掉的回合上时不带过去。
+    for (const turn of retained) {
       const cloned = { ...turn, id: newId(), threadId: id }
       this.store.upsertTurn(cloned)
       if (parentUsage?.turnId === turn.id)
@@ -1975,6 +1982,22 @@ export class CodexClaudeAppServer {
     if (!this.runtime.forkSession || !thread.claudeSessionId)
       throw new ProtocolError(-32000, '缺少原生会话或分叉能力')
     return this.runtime.forkSession(thread.claudeSessionId, thread.cwd, boundary)
+  }
+
+  // 分叉用的原生会话。回合全部带走时整份复制；只带走前面一段时复制到最后一个保留回合的
+  // 消息边界为止；一个回合都不带时不要原生会话，分叉从空白历史开始。
+  private async forkNativeHistory(
+    parent: ThreadRecord,
+    parentTurns: TurnRecord[],
+    retained: TurnRecord[],
+  ): Promise<NativeSessionFork | null> {
+    if (!parent.claudeSessionId) return null
+    if (retained.length === parentTurns.length) return this.forkNativeSession(parent)
+    const last = retained.at(-1)
+    if (!last) return null
+    const boundary = this.store.nativeBoundary(last.id)
+    if (!boundary) throw new ProtocolError(-32000, '缺少原生消息边界，不能安全分叉')
+    return this.forkNativeSession(parent, boundary)
   }
 
   private remapNativeBoundaries(

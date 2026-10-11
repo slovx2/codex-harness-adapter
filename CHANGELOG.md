@@ -5,7 +5,7 @@ The project is still private in `package.json`; this file tracks release notes
 for maintainers preparing the next public release and does not change package
 versioning or publishing metadata.
 
-## 未发布
+## 0.5.1
 
 - 修复 Claude 与 Pi 入口“从旧位置分叉”得到的对话与原对话完全相同的问题：`thread/fork` 现在按 `lastTurnId` / `beforeTurnId`
   截断，分叉里只保留该位置之前的回合，之后发给模型的历史也只含这些回合，源会话不变。此前这两个参数被忽略，总是整份复制，

@@ -2,6 +2,9 @@
 
 [简体中文](README.md) | **English**
 
+> **This repository has moved to [slovx2/litch](https://github.com/slovx2/litch) and is no longer updated.**
+> The adapter's code, future releases and issues live there (see its [ADAPTER.en.md](https://github.com/slovx2/litch/blob/main/ADAPTER.en.md)). Installation is unchanged: `brew install slovx2/tap/codex-harness-adapter`.
+
 ## What it solves
 
 **Control Claude Code, Pi, and other harnesses through the mature Codex desktop UI.** Manage projects, conversations, file changes, and approvals in one place while keeping each harness's own models and login.

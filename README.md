@@ -2,6 +2,9 @@
 
 **简体中文** | [English](README.en.md)
 
+> **本仓库已迁到 [slovx2/litch](https://github.com/slovx2/litch)，这里不再更新。**
+> 适配器的代码、后续版本和问题反馈都在新仓库（说明见那边的 [ADAPTER.md](https://github.com/slovx2/litch/blob/main/ADAPTER.md)）。安装方式不变：`brew install slovx2/tap/codex-harness-adapter`。
+
 ## 解决什么问题
 
 **用成熟的 Codex 桌面 UI 控制 Claude Code、Pi 等 harness。** 在一个界面里管理项目、对话、文件修改和审批，继续使用各引擎自己的模型配置与登录。
